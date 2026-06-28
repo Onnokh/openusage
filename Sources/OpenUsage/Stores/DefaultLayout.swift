@@ -25,6 +25,8 @@ enum DefaultLayout {
         "grok.creditsUsed", "grok.trend",
         "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",
 
+        "opencode-go.session", "opencode-go.weekly", "opencode-go.monthly",
+
         "openrouter.credits", "openrouter.balance",
         "openrouter.today", "openrouter.week", "openrouter.month", "openrouter.keyLimit"
     ]
@@ -58,6 +60,7 @@ enum DefaultLayout {
         "codex.session", "codex.weekly",
         "cursor.auto", "cursor.api",
         "copilot.premium",
+        "opencode-go.session",
         "openrouter.credits"
     ]
 
@@ -83,6 +86,9 @@ enum DefaultLayout {
         "copilot.chat", "copilot.completions",
         "devin.extra",
         "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",
+        // OpenCode Go: Session + Weekly quota meters stay above the fold; the slower-moving Monthly bar
+        // sits below the caret. Session stays primary so the caret appears.
+        "opencode-go.monthly",
         // OpenRouter: Credits meter + Balance stay above the fold; period spend and the per-key cap
         // sit below the caret.
         "openrouter.today", "openrouter.week", "openrouter.month", "openrouter.keyLimit"

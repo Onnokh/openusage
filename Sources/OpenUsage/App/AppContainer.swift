@@ -46,6 +46,7 @@ final class AppContainer {
             CopilotProvider(),
             DevinProvider(),
             GrokProvider(),
+            OpenCodeProvider(),
             OpenRouterProvider()
         ]
         let registry = WidgetRegistry.from(providers)
