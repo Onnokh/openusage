@@ -111,6 +111,14 @@ extension CursorUsageError: CategorizedError {
     }
 }
 
+extension OpenCodeAuthError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .notDetected: .notLoggedIn
+        }
+    }
+}
+
 extension GrokAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
