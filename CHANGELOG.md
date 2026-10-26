@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.7.16
+
+> **A new OpenUsage is coming.** The next update removes spend and token tracking, with no transition period, and moves sign-in into the app. To keep these features, stay on this version. Details: [#1441](https://github.com/robinebers/openusage/issues/1441)
+
+### New Features
+- Add Antigravity Argon quota and pricing ([#1395](https://github.com/robinebers/openusage/pull/1395)) by @validatedev
+- Add a dashboard notice that the next version drops spend and token tracking by @robinebers
+
+### Bug Fixes
+- Move dashboard caret below expanded metrics ([#1382](https://github.com/robinebers/openusage/pull/1382)) by @robinebers
+- Read only the new lines of growing Claude and Codex logs ([#1383](https://github.com/robinebers/openusage/pull/1383)) by @robinebers
+- Find Claude and Codex accounts off the main thread at launch ([#1384](https://github.com/robinebers/openusage/pull/1384)) by @robinebers
+- Check each Codex log line for event markers in one pass ([#1390](https://github.com/robinebers/openusage/pull/1390)) by @robinebers
+- fix(antigravity): restore Gemini meters and plan badge from Cloud Code ([#1407](https://github.com/robinebers/openusage/pull/1407)) by @validatedev
+- fix(cursor): Enterprise badge + Extra Usage from usage-summary ([#1409](https://github.com/robinebers/openusage/pull/1409)) by @dariocurr
+- Coalesce refresh-end work (Runway #47, MIT) ([#1391](https://github.com/robinebers/openusage/pull/1391)) by @robinebers
+- Claim Claude usage-limit resets from the resets popover ([#1413](https://github.com/robinebers/openusage/pull/1413)) by @robinebers
+
+### Chores
+- chore(deps): bump github.com/posthog/posthog-ios from 3.90.2 to 3.92.0 ([#1406](https://github.com/robinebers/openusage/pull/1406)) by @app/dependabot
+- ci(release): skip already-uploaded dSYMs on stable promotions by @robinebers
+- docs: changelog for v0.7.15 by @robinebers
+- docs: changelog for v0.7.16-beta.1 by @robinebers
+
+---
+
+### Changelog
+**Full Changelog**: [v0.7.15...v0.7.16](https://github.com/robinebers/openusage/compare/v0.7.15...v0.7.16)
+
+- [05c7a87](https://github.com/robinebers/openusage/commit/05c7a87805d7f0d76cb5048fbe4c4caa4d2de784) Move dashboard caret below expanded metrics (#1382) by @robinebers
+- [5c9d9a7](https://github.com/robinebers/openusage/commit/5c9d9a7724933b58bf14c094d59a530af315b017) Read only the new lines of growing Claude and Codex logs (#1383) by @robinebers
+- [bae20d9](https://github.com/robinebers/openusage/commit/bae20d9ca7eb5aaab93cdae2673846d24ee5e8d2) Find Claude and Codex accounts off the main thread at launch (#1384) by @robinebers
+- [063eb06](https://github.com/robinebers/openusage/commit/063eb0661ca810905e3f981aaaaff95a7df2e66e) Add Antigravity Argon quota and pricing (#1395) by @validatedev
+- [3a2c9bb](https://github.com/robinebers/openusage/commit/3a2c9bb08a46590505362fded31116de0ae2e710) chore(deps): bump github.com/posthog/posthog-ios from 3.90.2 to 3.92.0 (#1406) by @app/dependabot
+- [f0039b2](https://github.com/robinebers/openusage/commit/f0039b270d1f4a3b5152fe3253fca53ac304240f) Check each Codex log line for event markers in one pass (#1390) by @robinebers
+- [9e6d362](https://github.com/robinebers/openusage/commit/9e6d36235263e3b06087be7cafc35395ebd8f5ba) fix(antigravity): restore Gemini meters and plan badge from Cloud Code (#1407) by @validatedev
+- [eab20cf](https://github.com/robinebers/openusage/commit/eab20cfda184b2743c9c9e3ad561abad92abb4f0) fix(cursor): Enterprise badge + Extra Usage from usage-summary (#1409) by @dariocurr
+- [bfb0fbb](https://github.com/robinebers/openusage/commit/bfb0fbbf2acad3d0ae2b3d36f2266f35debddb7c) Coalesce refresh-end work (Runway #47, MIT) (#1391) by @robinebers
+- [a7953bf](https://github.com/robinebers/openusage/commit/a7953bf71ff0cd68680b2c553be5a6d7beb80c09) Claim Claude usage-limit resets from the resets popover (#1413) by @robinebers
+- [a9b2625](https://github.com/robinebers/openusage/commit/a9b26251d49d31e6663ab6ac351bffde2a37e7fc) docs: changelog for v0.7.15 by @robinebers
+- [c9afc90](https://github.com/robinebers/openusage/commit/c9afc904ab487914150ccb77c8e837c177de9975) docs: changelog for v0.7.16-beta.1 by @robinebers
+- [26132ff](https://github.com/robinebers/openusage/commit/26132ff48dd78eb2c4a9498e40424e6365f99fec) ci(release): skip already-uploaded dSYMs on stable promotions by @robinebers
+- [ad09121](https://github.com/robinebers/openusage/commit/ad091211563e2db0ae27825bdbd84bd6bab70128) Add a dashboard notice that the next version drops spend and token tracking by @robinebers
+
 ## v0.7.16-beta.1
 
 ### New Features
