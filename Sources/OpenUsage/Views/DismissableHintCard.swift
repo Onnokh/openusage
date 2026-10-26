@@ -2,14 +2,16 @@ import SwiftUI
 
 /// A dashboard hint/banner card: a leading glyph, a title + message, a primary action button, and a
 /// trailing dismiss (✕). A grouped content card (`cardSurface`) that scrolls with the sections. Shared
-/// scaffolding for the first-run `CustomizeHintCard` and the `UpdateBannerCard`, so the two read as one
-/// family and a spacing/appearance tweak lands in one place. Callers supply the copy and the two
-/// closures (each wraps its own animation as needed).
+/// scaffolding for the first-run `CustomizeHintCard`, the `UpdateBannerCard`, and the
+/// `NewVersionNoticeCard`, so they read as one family and a spacing/appearance tweak lands in one place.
+/// Callers supply the copy and the two closures (each wraps its own animation as needed). A `tint` turns
+/// the card into a warning: tinted glyph, fill, border, and a prominent action button.
 struct DismissableHintCard: View {
     let systemImage: String
     let title: String
     let message: String
     let buttonTitle: String
+    var tint: Color? = nil
     let action: () -> Void
     let onDismiss: () -> Void
 
@@ -17,7 +19,7 @@ struct DismissableHintCard: View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: systemImage)
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(tint.map(AnyShapeStyle.init) ?? AnyShapeStyle(.secondary))
                 .frame(width: 20, height: 20)
 
             VStack(alignment: .leading, spacing: 4) {
@@ -27,7 +29,7 @@ struct DismissableHintCard: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                Button(buttonTitle, action: action)
+                actionButton
                     .controlSize(.small)
                     .padding(.top, 2)
             }
@@ -44,6 +46,23 @@ struct DismissableHintCard: View {
             .accessibilityLabel("Dismiss")
         }
         .padding(12)
+        .background {
+            if let tint { Theme.cardShape.fill(tint.opacity(0.14)) }
+        }
         .cardSurface()
+        .overlay {
+            if let tint { Theme.cardShape.strokeBorder(tint.opacity(0.7), lineWidth: 1) }
+        }
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        if let tint {
+            Button(buttonTitle, action: action)
+                .buttonStyle(.borderedProminent)
+                .tint(tint)
+        } else {
+            Button(buttonTitle, action: action)
+        }
     }
 }
