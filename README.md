@@ -24,6 +24,7 @@ Either way, the app updates itself in place via signed, notarized [Sparkle](docs
 
 - **[Antigravity](docs/providers/antigravity.md)** — Gemini Pro/Flash and Claude model quotas
 - **[Claude](docs/providers/claude.md)** — session, weekly, Sonnet, extra usage, local daily spend (ccusage)
+- **[Claude via CLIProxyAPI](docs/providers/cliproxyapi.md)** — one card per Claude account in CLIProxyAPI: session, weekly, Sonnet, extra usage
 - **[Codex](docs/providers/codex.md)** — session, weekly, credits, local daily spend (ccusage)
 - **[Cursor](docs/providers/cursor.md)** — credits, total/auto/API usage, requests, on-demand, per-day spend
 - **[Devin](docs/providers/devin.md)** — weekly and daily quota, extra usage balance

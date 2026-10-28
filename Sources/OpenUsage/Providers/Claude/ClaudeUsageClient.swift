@@ -58,10 +58,20 @@ struct ClaudeUsageClient: Sendable {
     }
 
     func fetchUsage(accessToken: String, config: ClaudeOAuthConfig) async throws -> HTTPResponse {
+        try await get(config.usageURL, accessToken: accessToken)
+    }
+
+    /// The OAuth profile (`/api/oauth/profile`), next to the usage endpoint. Carries the organization's
+    /// plan for tokens that come without Claude Code's `subscriptionType`, such as CLIProxyAPI's.
+    func fetchProfile(accessToken: String, config: ClaudeOAuthConfig) async throws -> HTTPResponse {
+        try await get(config.usageURL.deletingLastPathComponent().appendingPathComponent("profile"), accessToken: accessToken)
+    }
+
+    private func get(_ url: URL, accessToken: String) async throws -> HTTPResponse {
         try await httpClient.send(
             HTTPRequest(
                 method: "GET",
-                url: config.usageURL,
+                url: url,
                 headers: [
                     "Authorization": "Bearer \(accessToken.trimmingCharacters(in: .whitespacesAndNewlines))",
                     "Accept": "application/json",

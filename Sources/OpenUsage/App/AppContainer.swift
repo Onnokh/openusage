@@ -37,9 +37,10 @@ final class AppContainer {
         // Claude, Codex, Cursor — then every other provider alphabetically by display name. This registry
         // order is the default provider order (`LayoutStore.orderedProviderIDs` falls back to it, and
         // `resetToDefault` seeds it), so the dashboard, Customize sections, and the per-provider reset
-        // menu all read this way.
-        let providers: [ProviderRuntime] = [
-            ClaudeProvider(),
+        // menu all read this way. CLIProxyAPI's Claude accounts (one card each, found at launch) sit right
+        // after Claude so all Claude cards read together.
+        let cliProxyClaude = CLIProxyAPIClaudeProvider.discover()
+        let providers: [ProviderRuntime] = [ClaudeProvider()] + cliProxyClaude + [
             CodexProvider(),
             CursorProvider(),
             AntigravityProvider(),
@@ -55,6 +56,9 @@ final class AppContainer {
         let notificationSettings = NotificationSettingsStore()
         let layout = LayoutStore(
             registry: registry,
+            defaultMetricIDs: DefaultLayout.metricIDs + cliProxyClaude.flatMap(\.defaultMetricIDs),
+            defaultPinnedMetricIDs: DefaultLayout.pinnedMetricIDs + cliProxyClaude.flatMap(\.defaultPinnedMetricIDs),
+            defaultExpandedMetricIDs: DefaultLayout.expandedMetricIDs + cliProxyClaude.flatMap(\.defaultExpandedMetricIDs),
             isProviderEnabled: { [enablement] in enablement.isEnabled($0) }
         )
         let dataStore = WidgetDataStore(
