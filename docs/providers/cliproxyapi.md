@@ -16,6 +16,15 @@ Each card is named after the account's email, for example **Claude · onno**. Th
 
 These cards have no Today / Yesterday / Last 30 Days tiles. Those come from local Claude Code logs, which can't be split per account. The main **Claude** card still shows them.
 
+## Primary account
+
+With two or more accounts, each card has a **Primary** switch. CLIProxyAPI sends requests to the account with the highest priority first, and uses the others only when that account is cooling down.
+
+- Turn the switch on to make that account primary. OpenUsage sets its priority to 100 and the priority of every other CLIProxyAPI Claude account to 0.
+- Turn it off to set all accounts to 0. CLIProxyAPI then spreads requests over all of them.
+
+OpenUsage changes only the `priority` field in the account files. CLIProxyAPI sees the change and uses it at once. If you change a priority in CLIProxyAPI's own management page, the switch shows it the next time you open OpenUsage.
+
 ## Where credentials come from
 
 OpenUsage reads the `claude-*.json` files in CLIProxyAPI's auth folder. It finds the folder from `auth-dir` in the first config that exists:

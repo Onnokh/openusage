@@ -43,6 +43,8 @@ final class AppContainer {
     /// The provider runtimes, kept so on-demand credential detection (the welcome screen and the
     /// Customize "Reset All" reseed) can re-probe `hasLocalCredentials()` on every card.
     let providers: [ProviderRuntime]
+    /// The Primary switch on the CLIProxyAPI Claude cards.
+    let cliProxyPrimary: CLIProxyAPIPrimaryStore
     /// Read-only usage API on 127.0.0.1:6736 for other local apps (silently off when the port is taken).
     private let localAPI: LocalUsageServer
     /// `nil` until `startRefreshing()`, which the welcome screen delays until the user has picked providers.
@@ -122,6 +124,7 @@ final class AppContainer {
             enablement: enablement
         )
         self.providers = providers
+        self.cliProxyPrimary = CLIProxyAPIPrimaryStore(accounts: cliProxyClaude.map(\.account))
         self.onboarding = onboarding
         self.registry = registry
         self.enablement = enablement
