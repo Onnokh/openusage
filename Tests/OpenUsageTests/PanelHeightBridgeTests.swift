@@ -44,6 +44,25 @@ final class PanelHeightBridgeTests: XCTestCase {
         await fulfillment(of: [droppedApply], timeout: 0.05)
     }
 
+    func testOpeningAcceptsNewHeightAfterDroppingPreviousSession() async {
+        resetBridge()
+        defer { resetBridge() }
+
+        var applied: [CGFloat] = []
+        let openingApply = expectation(description: "applies this opening's height")
+        MenuBarPopover.applyHeight = { height in
+            applied.append(height)
+            openingApply.fulfill()
+        }
+
+        PanelHeightBridge.push(480) // queued by the previous session
+        PanelHeightBridge.invalidate()
+        PanelHeightBridge.push(760) // measured for the display being opened on now
+
+        await fulfillment(of: [openingApply], timeout: 1)
+        XCTAssertEqual(applied, [760])
+    }
+
     func testEffectValuePushesEstablishedHeight() async {
         resetBridge()
         defer { resetBridge() }

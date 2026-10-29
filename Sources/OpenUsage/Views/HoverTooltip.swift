@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 /// A hover tooltip that behaves like the native `.help()` tooltip but appears after a delay we control
-/// (the native one waits ~1.5-2s on the first hover, with no public API to shorten) and is placed
-/// above the cursor, centered on it.
+/// (the native one waits ~1.5-2s on the first hover, with no public API to shorten) and is anchored
+/// to the hovered item: centered on it horizontally, just above its top edge.
 ///
 /// It's drawn in its own borderless, non-activating, click-through `NSPanel` — not a SwiftUI overlay.
 /// A SwiftUI overlay lives inside the popover's window and is clipped to it (and to the dashboard's
@@ -21,7 +21,7 @@ import SwiftUI
 /// separate window owned by `TooltipPresenter`.
 
 extension View {
-    /// Shows `text` in a hover tooltip after a short delay, positioned above the cursor. `nil` or empty
+    /// Shows `text` in a hover tooltip after a short delay, anchored above the hovered item. `nil` or empty
     /// shows nothing, so the many `someTooltip ?? ""` call sites keep their "no tooltip when blank"
     /// behavior. The text is also exposed as an accessibility hint — the part `.help()` gave VoiceOver.
     func hoverTooltip(_ text: String?) -> some View {
@@ -43,12 +43,63 @@ private extension EnvironmentValues {
     }
 }
 
+/// Turns every `hoverTooltip` in the subtree into a no-op. Share-card exports set this: `ImageRenderer`
+/// can't draw AppKit-backed views, so the tooltip's invisible `NSViewRepresentable` anchor would
+/// rasterize as the yellow "unsupported platform view" placeholder over the exported card.
+private struct TooltipsDisabledKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var hoverTooltipsDisabled: Bool {
+        get { self[TooltipsDisabledKey.self] }
+        set { self[TooltipsDisabledKey.self] = newValue }
+    }
+}
+
+/// Weak handle to the hovered target's backing `NSView`. The presenter resolves it to a screen rect
+/// lazily at show time (no continuous geometry publishing, and still correct if the popover moved).
+@MainActor
+private final class TooltipAnchor {
+    weak var view: NSView?
+    nonisolated init() {}
+
+    /// The target's frame in Cocoa screen coordinates, or `nil` once the view is gone or windowless.
+    var screenRect: NSRect? {
+        guard let view, let window = view.window else { return nil }
+        return window.convertToScreen(view.convert(view.bounds, to: nil))
+    }
+}
+
+/// Invisible background view whose only job is to hand its `NSView` (sized to the hover target by
+/// `.background`) to the anchor. Hit-test transparent so it can never swallow the hover or clicks.
+private struct TooltipAnchorView: NSViewRepresentable {
+    let anchor: TooltipAnchor
+
+    private final class PassthroughView: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = PassthroughView()
+        anchor.view = view
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        anchor.view = nsView
+    }
+}
+
 private struct HoverTooltipModifier: ViewModifier {
     let text: String?
     @Environment(\.tooltipDepth) private var depth
+    @Environment(\.hoverTooltipsDisabled) private var disabled
     /// Stable per-target identity, so the presenter can track which targets are currently hovered and
     /// drop this one on exit.
     @State private var id = UUID()
+    /// Tracks the target's backing view so the presenter can anchor the bubble to the item itself.
+    @State private var anchor = TooltipAnchor()
     /// Whether the cursor is currently inside this target, so `onChange(of: resolved)` knows whether to
     /// act when the text changes without a hover event firing.
     @State private var isHovering = false
@@ -59,11 +110,23 @@ private struct HoverTooltipModifier: ViewModifier {
         return text
     }
 
+    @ViewBuilder
     func body(content: Content) -> some View {
+        if disabled {
+            // Off-screen renders (share cards): no anchor view, no hover tracking — an AppKit-backed
+            // anchor would rasterize as a placeholder artifact in the exported PNG.
+            content
+        } else {
+            decorated(content)
+        }
+    }
+
+    private func decorated(_ content: Content) -> some View {
         content
             // Descendants nest one level deeper, so a child target outranks this one when a hover sits
             // inside both.
             .environment(\.tooltipDepth, depth + 1)
+            .background { TooltipAnchorView(anchor: anchor) }
             .accessibilityHint(resolved ?? "")
             // Continuous (not plain `onHover`) so the presenter always has the live hover state; it
             // reads the cursor itself at show time, so the reported location is unused here.
@@ -97,7 +160,7 @@ private struct HoverTooltipModifier: ViewModifier {
     private func syncPresenter() {
         guard isHovering else { return }
         if let resolved {
-            TooltipPresenter.shared.enter(id: id, text: resolved, depth: depth)
+            TooltipPresenter.shared.enter(id: id, text: resolved, depth: depth, anchor: anchor)
         } else {
             TooltipPresenter.shared.exit(id: id)
         }
@@ -113,6 +176,7 @@ private final class TooltipPresenter {
     private struct Target {
         let text: String
         let depth: Int
+        let anchor: TooltipAnchor
     }
 
     /// Targets the cursor is currently inside. More than one only while a hover sits in both a child
@@ -143,8 +207,9 @@ private final class TooltipPresenter {
     /// reshow shortcut, since a tuned reshow risks reopening the original complaint.
     private let revealDelay: Duration = .milliseconds(400)
 
-    /// Space above the cursor; the panel's bottom edge sits this far above the pointer.
-    private let cursorGap: CGFloat = 10
+    /// Space between the bubble and the anchor: the panel's bottom edge sits this far above the
+    /// hovered item's top edge (or below its bottom edge when flipped).
+    private let anchorGap: CGFloat = 10
 
     /// Bubble width past which a tooltip wraps onto multiple lines instead of stretching ever wider
     /// (#696). Sits comfortably under the 320pt popover so a wrapped tooltip never reads as a second panel.
@@ -181,8 +246,8 @@ private final class TooltipPresenter {
         panel.contentView = host
     }
 
-    func enter(id: UUID, text: String, depth: Int) {
-        active[id] = Target(text: text, depth: depth)
+    func enter(id: UUID, text: String, depth: Int, anchor: TooltipAnchor) {
+        active[id] = Target(text: text, depth: depth, anchor: anchor)
         refresh()
     }
 
@@ -265,14 +330,24 @@ private final class TooltipPresenter {
     private func present(_ target: Target) {
         let size = measuredSize(for: target)
         panel.setContentSize(size)
-        panel.setFrameOrigin(origin(for: size, cursor: NSEvent.mouseLocation))
+        // Anchor to the hovered item; fall back to an empty rect at the cursor if the item's view is
+        // already gone (defensive — the target exits on `.onDisappear`), which reproduces the old
+        // cursor-centered placement.
+        let cursor = NSEvent.mouseLocation
+        let anchorRect = target.anchor.screenRect
+            ?? NSRect(x: cursor.x, y: cursor.y, width: 0, height: 0)
+        panel.setFrameOrigin(origin(for: size, anchor: anchorRect))
         panel.orderFrontRegardless()                   // show without activating the app or taking key
     }
 
     /// Lays the bubble out at its natural single-line size, then — only when that would run wider than
-    /// `maxTooltipWidth` — re-lays it wrapped to that width, so a long tooltip breaks onto multiple lines
-    /// instead of stretching off-screen (#696) while short ones keep their snug single-line size. Leaves
-    /// `host.rootView` holding whichever bubble it settled on, which is the one shown.
+    /// `maxTooltipWidth` — re-lays it wrapped, so a long tooltip breaks onto multiple lines instead of
+    /// stretching off-screen (#696) while short ones keep their snug single-line size. Wrapped text is
+    /// laid out at the narrowest width that still fits the same number of lines as the max-width layout
+    /// (found by binary search on the measured height): lines come out roughly equal length and a lone
+    /// orphan word can't hang on the last line — the closest SwiftUI gets to CSS `text-wrap: pretty`
+    /// (there's no public `Text` API for it). A handful of extra layout passes, only at reveal time.
+    /// Leaves `host.rootView` holding whichever bubble it settled on, which is the one shown.
     private func measuredSize(for target: Target) -> CGSize {
         func fit(maxTextWidth: CGFloat?) -> CGSize {
             host.rootView = AnyView(TooltipBubble(text: target.text, maxTextWidth: maxTextWidth))
@@ -281,23 +356,41 @@ private final class TooltipPresenter {
         }
         let natural = fit(maxTextWidth: nil)
         guard natural.width > maxTooltipWidth else { return natural }
-        return fit(maxTextWidth: maxTooltipWidth - 2 * TooltipBubble.horizontalPadding)
+        let maxTextWidth = maxTooltipWidth - 2 * TooltipBubble.horizontalPadding
+        let wrapped = fit(maxTextWidth: maxTextWidth)
+        // Height grows monotonically as the width shrinks, so binary-search (to 1pt) the smallest text
+        // width whose layout is no taller than the max-width one.
+        var tooNarrow: CGFloat = 0
+        var fits = maxTextWidth
+        while fits - tooNarrow > 1 {
+            let mid = (tooNarrow + fits) / 2
+            if fit(maxTextWidth: mid).height > wrapped.height {
+                tooNarrow = mid
+            } else {
+                fits = mid
+            }
+        }
+        return fit(maxTextWidth: fits.rounded(.up))
     }
 
-    /// Above the cursor and centered on it, clamped to the cursor's screen; flips below the cursor when
-    /// it would clip the top. All math in Cocoa screen coordinates (bottom-left origin, y grows up),
-    /// matching `NSEvent.mouseLocation` and `NSScreen.visibleFrame`.
-    private func origin(for size: CGSize, cursor: NSPoint) -> NSPoint {
-        var x = cursor.x - size.width / 2
-        var y = cursor.y + cursorGap
-        let screen = NSScreen.screens.first { $0.frame.contains(cursor) } ?? NSScreen.main
+    /// Above the anchor rect and centered on it, clamped to the anchor's screen; flips below the anchor
+    /// when it would clip the top. All math in Cocoa screen coordinates (bottom-left origin, y grows
+    /// up), matching `convertToScreen` and `NSScreen.visibleFrame`.
+    private func origin(for size: CGSize, anchor: NSRect) -> NSPoint {
+        var x = anchor.midX - size.width / 2
+        var y = anchor.maxY + anchorGap
+        // The `contains` leg matters for the cursor fallback's zero-size anchor: an empty rect
+        // intersects nothing, so without it clamping would fall back to `NSScreen.main` instead of
+        // the screen under the cursor.
+        let screen = NSScreen.screens.first { $0.frame.intersects(anchor) || $0.frame.contains(anchor.origin) }
+            ?? NSScreen.main
         if let visible = screen?.visibleFrame {
             // Clamp leading edge into the visible frame. The `min` keeps the trailing edge in, the outer
             // `max` keeps the leading edge in even when the bubble is wider than the screen (it would
             // otherwise land off the left edge — a reversed-bounds clamp).
             x = max(visible.minX, min(x, visible.maxX - size.width))
             if y + size.height > visible.maxY {
-                y = cursor.y - cursorGap - size.height
+                y = anchor.minY - anchorGap - size.height
             }
             y = max(y, visible.minY)
         }
@@ -345,11 +438,11 @@ private struct TooltipBubble: View {
         let content = Text(text)
             .font(.system(size: 12))
             .foregroundStyle(.primary)
-            .multilineTextAlignment(.leading)
+            .multilineTextAlignment(.center)
         if let maxTextWidth {
             // A fixed width (not `maxWidth`) so the wrapped height measures deterministically via
             // `fittingSize`; `fixedSize(vertical:)` pins the bubble to that ideal wrapped height.
-            content.frame(width: maxTextWidth, alignment: .leading)
+            content.frame(width: maxTextWidth, alignment: .center)
                 .fixedSize(horizontal: false, vertical: true)
         } else {
             content.fixedSize()

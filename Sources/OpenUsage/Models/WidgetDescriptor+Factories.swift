@@ -1,20 +1,23 @@
 import Foundation
 
-/// Shared descriptor factories — the one place that knows how a descriptor's sample `WidgetData`
-/// is assembled, so a provider declares its gallery as a flat list instead of re-implementing the
-/// same private builders. Sample numbers are structural only (a row without real data renders the
-/// no-data marker, never the sample), so every factory seeds `used: 0`.
+/// Shared descriptor factories — the one place that knows how a descriptor's template `WidgetData`
+/// is assembled, so providers declare flat metric lists instead of re-implementing the same private
+/// builders. Template numbers are structural only (a row without real data renders the no-data marker,
+/// never the template), so every factory seeds `used: 0`.
 extension WidgetDescriptor {
-    /// Bounded 0–100% meter (session/weekly-style quotas).
+    /// Bounded 0–100% meter (session/weekly-style quotas). `sessionStartSignal` opts the tile into the
+    /// "Not started" fresh-window treatment (rolling 5-hour session pools) and names how that state is
+    /// detected for this provider — see `WidgetData.SessionStartSignal`.
     static func percent(
         id: String,
         provider: Provider,
         title: String,
-        metricLabel: String? = nil
+        metricLabel: String? = nil,
+        sessionStartSignal: WidgetData.SessionStartSignal? = nil
     ) -> WidgetDescriptor {
-        make(id: id, provider: provider, metricLabel: metricLabel ?? title,
-             sample: WidgetData(title: title, icon: provider.icon,
-                                kind: .percent, used: 0, limit: 100))
+        var sample = WidgetData(title: title, icon: provider.icon, kind: .percent, used: 0, limit: 100)
+        sample.sessionStartSignal = sessionStartSignal
+        return make(id: id, provider: provider, metricLabel: metricLabel ?? title, sample: sample)
     }
 
     /// Bounded dollar meter whose subtitle reads "$<limit> <limitNoun>" (noun defaults to "limit").
@@ -64,7 +67,9 @@ extension WidgetDescriptor {
         metricLabel: String? = nil,
         selection: ValueSelection = .all,
         valueWord: String? = nil,
-        isUsagePeriod: Bool = false
+        isUsagePeriod: Bool = false,
+        traySuffix: String? = nil,
+        showsResetExpiries: Bool = false
     ) -> WidgetDescriptor {
         // `kind` is unused for `.values` rendering (each value carries its own), but a count-only tile
         // reads tidier seeded as `.count`; everything else defaults to `.dollars`.
@@ -73,6 +78,8 @@ extension WidgetDescriptor {
                                 unboundedValueWord: valueWord)
         sample.selection = selection
         sample.isUsagePeriod = isUsagePeriod
+        sample.traySuffix = traySuffix
+        sample.showsResetExpiries = showsResetExpiries
         return make(id: id, provider: provider, metricLabel: metricLabel ?? title, sample: sample)
     }
 
@@ -92,22 +99,26 @@ extension WidgetDescriptor {
     /// The three local-spend tiles every spend-tracking provider exposes — Today / Yesterday / Last 30
     /// Days — each a combined "cost · tokens" row, backed by `SpendTileMapper`. Ids are
     /// `<provider>.today|yesterday|last30`, so the set is identical across Claude / Codex / Cursor / Grok.
-    static func spendTiles(provider: Provider) -> [WidgetDescriptor] {
+    static func spendTiles(provider: Provider, valueTooltipNote: String? = nil) -> [WidgetDescriptor] {
         let descriptors: [WidgetDescriptor] = [
             .combined(id: "\(provider.id).today", provider: provider, title: "Today", isUsagePeriod: true),
             .combined(id: "\(provider.id).yesterday", provider: provider, title: "Yesterday", isUsagePeriod: true),
             .combined(id: "\(provider.id).last30", provider: provider, title: "Last 30 Days", isUsagePeriod: true)
         ]
-        guard provider.id == "cursor" else { return descriptors }
+        // Mark the whole set as the local spend tiles — the Total Spend card's capability and
+        // contribution signal.
         return descriptors.map { descriptor in
             var sample = descriptor.sample
-            sample.valueTooltipNote = WidgetData.cursorUsageHistoryNote
+            sample.valueTooltipNote = valueTooltipNote
             return WidgetDescriptor(
                 id: descriptor.id,
                 providerID: descriptor.providerID,
                 metricLabel: descriptor.metricLabel,
                 sample: sample,
-                pinnable: descriptor.pinnable
+                pinnable: descriptor.pinnable,
+                isSpendTile: true,
+                limitResources: descriptor.limitResources,
+                historyResource: descriptor.historyResource
             )
         }
     }
@@ -139,21 +150,14 @@ extension WidgetDescriptor {
     }
 
     /// The Usage Trend row: a day-by-day token sparkline backed by a provider `.chart` line. Not
-    /// pinnable — the tray can't draw a chart — but otherwise a normal Customize widget (toggle,
-    /// reorder, hide). The sample carries a few bars so it reads as a chart in the gallery.
+    /// pinnable — the tray can't draw a chart — but otherwise a normal Customize metric (toggle,
+    /// reorder, hide). `isChart` tells the dashboard how to render live chart points.
     static func usageTrend(provider: Provider) -> WidgetDescriptor {
         var sample = WidgetData(title: "Usage Trend", icon: provider.icon, kind: .count, used: 0, limit: nil)
         sample.isChart = true
-        sample.chartPoints = sampleTrendPoints
         return make(id: "\(provider.id).trend", provider: provider, metricLabel: "Usage Trend",
                     sample: sample, pinnable: false)
     }
-
-    /// A gentle wave of sample bars so the gallery preview reads as a trend chart, never confused for
-    /// real usage (the dashboard renders real points or "No data", never this sample).
-    private static let sampleTrendPoints: [MetricChartPoint] = [
-        9, 14, 11, 22, 13, 18, 25, 16, 12, 28, 20, 15, 31, 19, 24
-    ].enumerated().map { MetricChartPoint(value: Double($0.element), label: "\($0.offset)") }
 
     private static func make(
         id: String,

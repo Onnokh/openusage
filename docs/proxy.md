@@ -39,4 +39,4 @@ When the URL has no port, the scheme's default applies (socks5 â†’ 1080, http â†
 
 ## Scope
 
-Applies to provider HTTP requests made by the app. It is not a system-wide proxy and does not affect helper processes (like the local `ccusage` runs, which don't use the network).
+Applies to provider HTTP requests made by the app, including the daily [model pricing](pricing.md) refresh. It is not a system-wide proxy.

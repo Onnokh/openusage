@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import KeyboardShortcuts
-import ServiceManagement
 import SwiftUI
 import UserNotifications
 
@@ -13,17 +12,16 @@ import UserNotifications
 /// (auto-check, beta channel, and a full-width manual check button).
 struct SettingsScreen: View {
     @Environment(AppContainer.self) private var container
+    @Environment(LayoutStore.self) private var layout
     @Environment(UpdaterController.self) private var updater
 
-    /// Launch at login goes through the system login-item registry (`SMAppService`), which is the
-    /// source of truth — no shadow preference key. Registration can fail (e.g. unbundled `swift run`),
-    /// so a failed flip resyncs the toggle from the actual status, logs the error, and surfaces a
-    /// friendly line under the row.
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
-    @State private var launchAtLoginError: String?
+    @State private var launchAtLogin = LaunchAtLoginSetting()
+    @State private var commandLineTool = CommandLineToolInstaller()
+    @AppStorage(TotalSpendSetting.key) private var showTotalSpend = true
     @AppStorage(AppearanceSetting.key) private var appearance = AppearanceSetting.system
     @AppStorage(TimeFormatSetting.key) private var timeFormat = TimeFormatSetting.auto
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+    @AppStorage(ReduceAnimationsSetting.key) private var reduceAnimations = ReduceAnimationsSetting.fallback
     @AppStorage(LogLevelSetting.key) private var logLevel = LogLevelSetting.fallback
     /// Surfaced under the Advanced rows when copying the path or revealing the file fails.
     @State private var logActionError: String?
@@ -33,6 +31,15 @@ struct SettingsScreen: View {
     /// System Settings after re-enabling).
     private enum NotificationsAuthState { case authorized, denied, notDetermined }
     @State private var notificationsAuth: NotificationsAuthState = .authorized
+    /// Gates the destructive Reset All Settings action behind a confirmation alert. Settings remains
+    /// mounted after its first visit, so leaving the screen must explicitly dismiss a pending alert.
+    @State private var isPresentingResetConfirm = false
+    /// Remounts `ShortcutRecorderField` after a reset. The field seeds its chip from the
+    /// KeyboardShortcuts store only on appear (the store isn't observable), so without a fresh
+    /// identity the still-mounted Settings screen would keep showing the cleared shortcut.
+    @State private var shortcutFieldGeneration = 0
+    /// Settings stays mounted between visits, so explicitly restore its previous scroll-to-top behavior.
+    @State private var scrollPosition = ScrollPosition(edge: .top)
 
     /// Fills the region the dashboard's pinned footer leaves. Same scroller treatment as Customize:
     /// the overlay scroller stays (the scroll edge effect needs it) but is invisible.
@@ -40,147 +47,219 @@ struct SettingsScreen: View {
         PopoverScrollView {
             content
         }
+        .scrollPosition($scrollPosition)
     }
 
     private var content: some View {
-        @Bindable var store = container.dataStore
-        @Bindable var layout = container.layout
-        @Bindable var updater = updater
-        @Bindable var notifications = container.notificationSettings
         // Same section rhythm as the dashboard and Customize (all read the density setting).
-        return VStack(alignment: .leading, spacing: density.sectionSpacing) {
-            section("General") {
-                row("Launch at Login") {
-                    Toggle("", isOn: $launchAtLogin)
-                        .settingsSwitchStyle()
-                        .onChange(of: launchAtLogin) { _, enabled in
-                            do {
-                                if enabled {
-                                    try SMAppService.mainApp.register()
-                                } else {
-                                    try SMAppService.mainApp.unregister()
-                                }
-                                launchAtLoginError = nil
-                            } catch {
-                                AppLog.error(.config, "Launch at Login \(enabled ? "register" : "unregister") failed: \(error.localizedDescription)")
-                                launchAtLoginError = "macOS wouldn't update Launch at Login. Check System Settings → Login Items."
-                                launchAtLogin = SMAppService.mainApp.status == .enabled
-                            }
-                        }
-                }
-                if let launchAtLoginError {
-                    // Same orange inline-notice idiom as the footer's pin-denied message.
-                    Text(launchAtLoginError)
-                        .font(.caption)
-                        .foregroundStyle(Theme.notice)
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                // Click-to-record field; its ⓧ clears the combo and disables the shortcut.
-                row("Global Shortcut") {
-                    ShortcutRecorderField(name: .togglePopover)
-                        .hoverTooltip("Open OpenUsage from anywhere")
-                }
-            }
-            section("Appearance") {
-                row("Icon Style") {
-                    picker($layout.menuBarStyle, options: MenuBarStyle.allCases, label: \.label)
-                }
-                row("Theme") {
-                    picker($appearance, options: AppearanceSetting.allCases, label: \.label)
-                        // NSApp-level so the popover panel restyles too (it ignores preferredColorScheme).
-                        .onChange(of: appearance) {
-                            AppearanceSetting.applyCurrent()
-                        }
-                }
-                row("Density") {
-                    picker($density, options: DensitySetting.allCases, label: \.label)
-                }
-                row("Time Format") {
-                    picker($timeFormat, options: TimeFormatSetting.allCases, label: \.label)
-                }
-            }
-            section("Usage Display") {
-                row("Show Usage As") {
-                    picker($store.meterStyle, options: WidgetDisplayMode.allCases, label: \.label)
-                }
-                row("Reset Times") {
-                    picker($store.resetDisplayMode, options: ResetDisplayMode.allCases, label: \.label)
-                }
-                // Off (default) leaves pacing on yellow and red only. On also surfaces projection
-                // and the even-pace tick on blue rows.
-                row("Always Show Pacing") {
-                    Toggle("", isOn: $store.alwaysShowPacing)
-                        .settingsSwitchStyle()
-                        .hoverTooltip("Show how you're pacing on every metric, not just ones near their limit")
-                }
-            }
+        VStack(alignment: .leading, spacing: density.sectionSpacing) {
+            generalSection
+            ICloudSyncSettingsSection(sync: container.iCloudSync)
+            appearanceSection
+            usageDisplaySection
             notificationsSection
-            #if DEBUG
-            debugNotificationsSection
-            #endif
-            section("Providers") {
-                ForEach(container.registry.providers) { provider in
-                    providerRow(provider)
-                }
-            }
-            // Key management for providers that need a user-supplied key (OpenRouter today). Sits in its
-            // own card so Providers stays pure enable toggles — the Option 2 split from the API-key UX
-            // canvas. Hidden when no installed provider needs a key.
-            if !container.apiKeyProviders.isEmpty {
-                APIKeysSection(providers: container.apiKeyProviders)
-            }
-            section("Privacy") {
-                row("Share Anonymous Usage") {
-                    Toggle("", isOn: Binding(
-                        get: { container.telemetry.isEnabled },
-                        set: { container.telemetry.setEnabled($0) }
-                    ))
-                    .settingsSwitchStyle()
-                }
-                // Plain-language disclosure of exactly what leaves the machine — coarse counts and
-                // error types only, never account details or usage values.
-                Text("Shares anonymous usage counts and error types to help improve OpenUsage. No account details, credentials, or usage values are sent.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            privacySection
+            commandLineSection
             advancedSection
-            // Visible whenever the updater is active (only the signed release build ships a feed; the
-            // dev build and a bare `swift run`, with no feed, hide this).
-            if updater.isActive {
-                section("Updates") {
-                    row("Update Automatically") {
-                        Toggle("", isOn: $updater.automaticallyChecksForUpdates)
-                            .settingsSwitchStyle()
-                    }
-                    row("Beta Updates") {
-                        Toggle("", isOn: $updater.betaChannelEnabled)
-                            .settingsSwitchStyle()
-                            .hoverTooltip("Receive pre-release builds before they ship to everyone")
-                    }
-                    // No version label here — the footer already shows it. The frame goes on the label so
-                    // the glass background stretches the full row width instead of hugging the text.
-                    // (Glass on macOS 26+, bordered fallback on macOS 15.)
-                    Button { updater.checkForUpdates() } label: {
-                        Text("Check for Updates…").frame(maxWidth: .infinity)
-                    }
-                    .glassButtonStyle()
-                    .controlSize(.regular)
-                    .disabled(!updater.canCheckForUpdates)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, density.controlRowPadding)
-                }
-            }
+            updatesSection
+            // Mirror of the Customize cross-link — the layout controls live on the other screen.
+            ScreenCrossLinkRow(
+                systemImage: "slider.horizontal.3",
+                title: "Customize",
+                subtitle: "Choose what's visible and where",
+                destination: .customize
+            )
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .task { await refreshNotificationsAuth() }
+        .onChange(of: layout.screen) { _, screen in
+            if screen == .settings {
+                scrollPosition.scrollTo(edge: .top)
+                launchAtLogin.refreshStatus()
+                commandLineTool.refreshStatus()
+                Task { await refreshNotificationsAuth() }
+            } else {
+                isPresentingResetConfirm = false
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            guard layout.screen == .settings else { return }
+            launchAtLogin.refreshStatus()
+            commandLineTool.refreshStatus()
             Task { await refreshNotificationsAuth() }
+        }
+    }
+
+    private var generalSection: some View {
+        section("General") {
+            // The dashboard's cross-provider Total Spend card; at least one enabled spend-capable
+            // provider must exist, so this toggle can't conjure it up alone.
+            row("Show Total Spend") {
+                Toggle("", isOn: $showTotalSpend)
+                    .settingsSwitchStyle()
+            }
+            row("Launch at Login") {
+                Toggle("", isOn: Binding(
+                    get: { launchAtLogin.isEnabled },
+                    set: { launchAtLogin.update(to: $0) }
+                ))
+                    .settingsSwitchStyle()
+            }
+            if let launchAtLoginError = launchAtLogin.errorMessage {
+                inlineNotice(launchAtLoginError)
+            }
+            // Click-to-record field; its ⓧ clears the combo and disables the shortcut.
+            row("Global Shortcut") {
+                ShortcutRecorderField(name: .togglePopover, isVisible: layout.screen == .settings)
+                    .id(shortcutFieldGeneration)
+                    .hoverTooltip("Open OpenUsage from anywhere")
+            }
+        }
+    }
+
+    private var appearanceSection: some View {
+        @Bindable var layout = container.layout
+        @Bindable var transparency = container.transparency
+        return section("Appearance") {
+            row("Icon Style") {
+                picker($layout.menuBarStyle, options: MenuBarStyle.allCases, label: \.label)
+            }
+            row("Theme") {
+                picker($appearance, options: AppearanceSetting.allCases, label: \.label)
+                    // NSApp-level so the popover panel restyles too (it ignores preferredColorScheme).
+                    .onChange(of: appearance) {
+                        AppearanceSetting.applyCurrent()
+                    }
+            }
+            row("Density") {
+                picker($density, options: DensitySetting.allCases, label: \.label)
+            }
+            row("Reduce Animations") {
+                Toggle("", isOn: $reduceAnimations)
+                    .settingsSwitchStyle()
+            }
+            row("Time Format") {
+                picker($timeFormat, options: TimeFormatSetting.allCases, label: \.label)
+            }
+            // Translucent popover the proper way (behind-window vibrancy, text stays legible). It
+            // yields to the system accessibility settings, and to the party easter egg while that's
+            // running (the egg drives the look) — either way, see the paused notice below.
+            row("Increase Transparency") {
+                Toggle("", isOn: $transparency.increaseTransparency)
+                    .settingsSwitchStyle()
+                    // Party mode owns the look while it's active, so disable (dim) the toggle to show
+                    // it has no effect right now — its stored value resumes once the egg is exited.
+                    .disabled(transparency.secretCodeActive)
+            }
+            // Egg first: while Party runs it overrides the toggle regardless of the system flags, so
+            // its notice takes precedence over the accessibility one.
+            if transparency.secretCodeActive {
+                inlineNotice("Party mode is on, so this stays paused.")
+            } else if transparency.isPaused {
+                inlineNotice("macOS Reduce Transparency or Increase Contrast is on, so this stays paused.")
+            }
+            // Both rows surface only after the secret code has been entered. Party Mode is the egg's
+            // own switch: turning it off (like re-typing the code) exits the egg and hides both rows,
+            // dropping back to the base state. Drunk Mode escalates the readable party into the woozy,
+            // barely-readable state and back — turning it off stays in the party (4 → 3), while turning
+            // Party Mode off from there clears Drunk Mode too (4 → base).
+            if transparency.secretCodeActive {
+                row("Party Mode") {
+                    Toggle("", isOn: $transparency.partyModeActive)
+                        .settingsSwitchStyle()
+                }
+                row("Drunk Mode") {
+                    Toggle("", isOn: $transparency.drunkMode)
+                        .settingsSwitchStyle()
+                }
+                // The egg yields to the accessibility flags too: when one is on the panel stays
+                // opaque, so explain why the party looks normal rather than leaving it a mystery.
+                if transparency.partyPaused {
+                    inlineNotice("macOS Reduce Transparency or Increase Contrast is on, so the party stays paused.")
+                }
+            }
+        }
+    }
+
+    private var usageDisplaySection: some View {
+        @Bindable var store = container.dataStore
+        return section("Usage Display") {
+            row("Show Usage As") {
+                picker($store.meterStyle, options: WidgetDisplayMode.allCases, label: \.label)
+            }
+            row("Reset Times") {
+                picker($store.resetDisplayMode, options: ResetDisplayMode.allCases, label: \.label)
+            }
+            // Off (default) leaves pacing on yellow and red only. On also surfaces projection
+            // and the even-pace tick on blue rows.
+            row("Always Show Pacing") {
+                Toggle("", isOn: $store.alwaysShowPacing)
+                    .settingsSwitchStyle()
+                    .hoverTooltip("Show how you're pacing on every metric, not just ones near their limit")
+            }
+        }
+    }
+
+    private var privacySection: some View {
+        @Bindable var privacy = container.privacy
+        return section("Privacy") {
+            row("Hide From Screen Share") {
+                Toggle("", isOn: $privacy.hideUsageWhileScreenSharing)
+                    .settingsSwitchStyle()
+            }
+            Text("While your screen is shared or recorded, the menu bar shows “OpenUsage” instead of your usage.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            row("Help Make OpenUsage Better") {
+                Toggle("", isOn: Binding(
+                    get: { container.telemetry.isEnabled },
+                    set: { container.telemetry.setEnabled($0) }
+                ))
+                .settingsSwitchStyle()
+            }
+            // Daily activity and crash reports are always on; the toggle only gates extra analytics.
+            Text("Share additional anonymous usage stats that tell the team where to improve.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private var updatesSection: some View {
+        @Bindable var updater = updater
+        // Visible whenever the updater is active (only the signed release build ships a feed; the
+        // dev build and a bare `swift run`, with no feed, hide this).
+        if updater.isActive {
+            section("Updates") {
+                row("Check Automatically") {
+                    Toggle("", isOn: $updater.automaticallyChecksForUpdates)
+                        .settingsSwitchStyle()
+                        .hoverTooltip("Checks hourly and shows a banner when an update is available.")
+                }
+                row("Beta Updates") {
+                    Toggle("", isOn: $updater.betaChannelEnabled)
+                        .settingsSwitchStyle()
+                        .hoverTooltip("Receive pre-release builds before they ship to everyone")
+                }
+                // No version label here — the footer already shows it. The frame goes on the label so
+                // the glass background stretches the full row width instead of hugging the text.
+                // (Glass on macOS 26+, bordered fallback on macOS 15.)
+                Button { updater.checkForUpdates() } label: {
+                    Text("Check for Updates…").frame(maxWidth: .infinity)
+                }
+                .glassButtonStyle()
+                .controlSize(.regular)
+                .disabled(!updater.canCheckForUpdates)
+                .padding(.horizontal, 12)
+                .padding(.vertical, density.controlRowPadding)
+            }
         }
     }
 
@@ -269,9 +348,9 @@ struct SettingsScreen: View {
     }
 
     /// True when at least one trigger is on — the gate for the permission warning + action row.
+    /// Delegates to the store's `anyEnabled` so the disjunction lives in one place.
     private var anyToggleOn: Bool {
-        let n = container.notificationSettings
-        return n.underTenPercent || n.healthyToClose || n.closeToRunningOut
+        container.notificationSettings.anyEnabled
     }
 
     /// Read the live macOS authorization status into `notificationsAuth`, but only when at least one
@@ -289,51 +368,40 @@ struct SettingsScreen: View {
         }
     }
 
-    #if DEBUG
-    /// Temporary debug buttons that post real quota notifications so the copy, stacking, and permission
-    /// flow can be verified on demand without waiting for a real worsening. DEBUG-only — never in a
-    /// release build. Remove once notification behavior is confirmed.
-    private var debugNotificationsSection: some View {
-        section("Debug") {
-            row("Almost Out") {
-                Button("Fire") { fire(.underTenPercent) }.buttonStyle(.bordered)
-            }
-            row("Cutting It Close") {
-                Button("Fire") { fire(.healthyToClose) }.buttonStyle(.bordered)
-            }
-            row("Will Run Out") {
-                Button("Fire") { fire(.closeToRunningOut) }.buttonStyle(.bordered)
-            }
-            row("All Three") {
-                Button("Fire") {
-                    fire(.underTenPercent)
-                    fire(.healthyToClose)
-                    fire(.closeToRunningOut)
-                }
-                .buttonStyle(.bordered)
-            }
-        }
-    }
+    // MARK: - Command Line
 
-    /// Post one real notification for a milestone so the banner title/subtitle/body and stacking can be
-    /// checked directly. Bypasses the dedup/prime logic — a manual trigger for testing only.
-    private func fire(_ milestone: PaceMilestone) {
-        Task {
-            _ = await AppNotifications.shared.post(
-                idPrefix: "debug.\(milestone.rawValue)",
-                title: milestone.notificationTitle,
-                subtitle: "Claude Session",
-                body: milestone.body
-            )
+    private var commandLineSection: some View {
+        section("Command Line") {
+            row("Terminal Helper") {
+                switch commandLineTool.status {
+                case .installed:
+                    Button("Uninstall") { commandLineTool.uninstall() }
+                case .notInstalled:
+                    Button("Install…") { commandLineTool.install() }
+                case .conflict:
+                    Text("Unavailable")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text("Adds a global `openusage` command agents can use to monitor limits.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if commandLineTool.status == .conflict {
+                inlineNotice("\(commandLineTool.destinationPath) already exists and wasn't installed by OpenUsage.")
+            } else if let errorMessage = commandLineTool.errorMessage {
+                inlineNotice(errorMessage)
+            }
         }
     }
-    #endif
 
     // MARK: - Advanced (logging)
 
-    /// Log-level control plus copy/reveal buttons for the file log. The file lives at a fixed path
-    /// (`~/Library/Logs/OpenUsage/OpenUsage.log`); raising the level here applies live (no restart) and
-    /// persists across launches. Default Info, Debug is opt-in.
+    /// Log-level control plus copy/reveal buttons for the file log, and the Reset All Settings row.
+    /// The file lives at a fixed path (`~/Library/Logs/OpenUsage/OpenUsage.log`); raising the level
+    /// here applies live (no restart) and persists across launches. Default Info, Debug is opt-in.
     private var advancedSection: some View {
         section("Advanced") {
             row("Log Level") {
@@ -359,13 +427,33 @@ struct SettingsScreen: View {
                 logActionError = nil
             }
             if let logActionError {
-                // Same orange inline-notice idiom as the General section's error line.
-                Text(logActionError)
-                    .font(.caption)
-                    .foregroundStyle(Theme.notice)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                inlineNotice(logActionError)
+            }
+            // The Settings-wide destructive reset (issue #602). Red label, confirmation alert;
+            // confirming restores every preference to its default — the container-owned stores plus
+            // the two view-scoped ones (Launch at Login lives in the system's login-item registry,
+            // the update preferences on the updater controller).
+            Button {
+                isPresentingResetConfirm = true
+            } label: {
+                Text("Reset All Settings…")
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity)
+            }
+            .glassButtonStyle()
+            .controlSize(.regular)
+            .padding(.horizontal, 12)
+            .padding(.vertical, density.controlRowPadding)
+            .alert("Reset All Settings?", isPresented: $isPresentingResetConfirm) {
+                Button("Reset", role: .destructive) {
+                    withAnimation(Motion.spring) { container.resetAllSettings() }
+                    launchAtLogin.update(to: false)
+                    updater.resetToDefaults()
+                    shortcutFieldGeneration += 1
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Restores every setting and customization to its default and turns providers back on for the tools you have installed. If iCloud sync is on, it turns off and this Mac's synced history is removed. This cannot be undone.")
             }
         }
     }
@@ -415,6 +503,18 @@ struct SettingsScreen: View {
         .padding(.vertical, density.controlRowPadding)
     }
 
+    /// An inline orange caption under a row — the single definition of the notice idiom shared by the
+    /// General/Advanced error lines and the "this setting is paused" captions (Increase Transparency
+    /// paused by a system accessibility setting, or by Party mode taking over the look).
+    private func inlineNotice(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(Theme.notice)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     /// A trailing popup picker that hugs its selection — segmented controls don't fit the 320pt
     /// popover once options have real words in them.
     private func picker<Value: Hashable>(
@@ -430,21 +530,5 @@ struct SettingsScreen: View {
         .pickerStyle(.menu)
         .labelsHidden()
         .fixedSize()
-    }
-
-    private func providerRow(_ provider: Provider) -> some View {
-        HStack(spacing: 10) {
-            ProviderIcon(source: provider.icon)
-                .frame(width: 18, height: 18)
-            Text(provider.displayName)
-            Spacer(minLength: 8)
-            Toggle("", isOn: Binding(
-                get: { container.enablement.isEnabled(provider.id) },
-                set: { container.enablement.setEnabled($0, for: provider.id) }
-            ))
-            .settingsSwitchStyle()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, density.controlRowPadding)
     }
 }

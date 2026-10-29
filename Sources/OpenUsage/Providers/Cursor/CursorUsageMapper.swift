@@ -5,6 +5,60 @@ struct CursorMappedUsage: Equatable, Sendable {
     var lines: [MetricLine]
 }
 
+/// The handful of facts the three plan-usage decisions read off Cursor's untyped `usage` payload —
+/// the map guards, the request-based fallback, and the generic fallback. Decoded once here so those
+/// predicates can't drift apart (they steer one flow and previously spelled the same checks out
+/// independently across two files).
+struct CursorPlanUsageFacts {
+    /// `usage.enabled` is only "off" when explicitly `false`; absent reads as enabled.
+    let isEnabled: Bool
+    /// A `planUsage` object is present at all.
+    let hasPlanUsage: Bool
+    /// `planUsage.limit`, when numeric.
+    let limit: Double?
+    /// `planUsage.totalPercentUsed`, when numeric.
+    let totalPercentUsed: Double?
+    /// Two usable model-pool percentages, excluding legacy zero placeholders beside positive spend.
+    let hasModelPools: Bool
+    /// `spendLimitUsage.limitType`, lowercased.
+    let spendLimitType: String?
+    /// `spendLimitUsage.pooledLimit` (0 when absent).
+    let pooledLimit: Double
+
+    init(usage: [String: Any]) {
+        isEnabled = usage["enabled"] as? Bool != false
+        let planUsage = usage["planUsage"] as? [String: Any]
+        hasPlanUsage = planUsage != nil
+        limit = planUsage.flatMap { ProviderParse.number($0["limit"]) }
+        totalPercentUsed = planUsage.flatMap { ProviderParse.number($0["totalPercentUsed"]) }
+        let auto = planUsage.flatMap { ProviderParse.number($0["autoPercentUsed"]) }
+        let api = planUsage.flatMap { ProviderParse.number($0["apiPercentUsed"]) }
+        let spent = planUsage.flatMap { ProviderParse.number($0["totalSpend"]) }
+            ?? ((limit ?? 0) - (planUsage.flatMap { ProviderParse.number($0["remaining"]) } ?? limit ?? 0))
+        if let auto, let api, auto.isFinite, api.isFinite, auto >= 0, api >= 0 {
+            hasModelPools = auto > 0 || api > 0 || spent == 0
+        } else {
+            hasModelPools = false
+        }
+        let spendLimitUsage = usage["spendLimitUsage"] as? [String: Any]
+        spendLimitType = (spendLimitUsage?["limitType"] as? String)?.lowercased()
+        pooledLimit = ProviderParse.number(spendLimitUsage?["pooledLimit"]) ?? 0
+    }
+
+    var hasLimit: Bool { limit != nil }
+    var hasTotalUsagePercent: Bool { totalPercentUsed != nil }
+    /// `planUsage` exists but carries no usable limit — the "present but unusable" state the fallbacks key on.
+    var planUsageLimitMissing: Bool { hasPlanUsage && !hasLimit }
+    var planUsageUnusable: Bool { !hasPlanUsage || (planUsageLimitMissing && !hasModelPools) }
+    /// Team account inferred from the spend-limit shape alone (independent of the plan name).
+    var isTeamByShape: Bool { spendLimitType == "team" || pooledLimit > 0 }
+    /// The generic request-based fallback trigger: an enabled account with a `planUsage` that carries
+    /// neither a limit nor a total-percent figure.
+    var shouldTryGenericRequestFallback: Bool {
+        isEnabled && hasPlanUsage && !hasLimit && !hasTotalUsagePercent && !hasModelPools
+    }
+}
+
 enum CursorUsageError: Error, LocalizedError, Equatable {
     case connectionFailed
     case invalidResponse
@@ -37,23 +91,53 @@ enum CursorUsageError: Error, LocalizedError, Equatable {
 enum CursorUsageMapper {
     static let billingPeriodMs = MetricPeriod.monthMs
 
+    /// Grok Bot is Cursor's "Sand" product, with its own weekly allowance and reset window. Pooled
+    /// enterprise accounts and accounts without an included allowance have no separate personal meter.
+    static func mapGrokBotUsage(_ usage: [String: Any]) -> MetricLine? {
+        guard usage["usesPooledEnterpriseAllowance"] as? Bool != true,
+              usage["hasNonZeroIncludedLimit"] as? Bool != false,
+              usage["includedLimitZero"] as? Bool != true,
+              let percent = ProviderParse.number(usage["usagePercent"]),
+              percent >= 0
+        else {
+            return nil
+        }
+
+        let reset = (usage["nextResetTimestampUtc"] as? String).flatMap(OpenUsageISO8601.date(from:))
+        let start = (usage["currentPeriodStart"] as? String).flatMap(OpenUsageISO8601.date(from:))
+        let periodDurationMs: Int
+        if let start, let reset, reset > start {
+            periodDurationMs = Int(reset.timeIntervalSince(start) * 1000)
+        } else {
+            periodDurationMs = MetricPeriod.weekMs
+        }
+
+        return .progress(
+            label: "Grok Bot usage",
+            used: ProviderParse.clampPercent(percent),
+            limit: 100,
+            format: .percent,
+            resetsAt: reset,
+            periodDurationMs: periodDurationMs
+        )
+    }
+
     static func mapUsage(
         usage: [String: Any],
         planName: String?,
         creditGrants: [String: Any]?,
         stripeBalanceCents: Double
     ) throws -> CursorMappedUsage {
-        guard usage["enabled"] as? Bool != false,
+        let facts = CursorPlanUsageFacts(usage: usage)
+        guard facts.isEnabled,
               let planUsage = usage["planUsage"] as? [String: Any]
         else {
             throw CursorUsageError.noActiveSubscription
         }
 
         let normalizedPlan = planName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        let hasPlanUsageLimit = ProviderParse.number(planUsage["limit"]) != nil
-        let hasTotalUsagePercent = ProviderParse.number(planUsage["totalPercentUsed"]) != nil
 
-        guard hasPlanUsageLimit || hasTotalUsagePercent else {
+        guard facts.hasLimit || facts.hasTotalUsagePercent || facts.hasModelPools else {
             throw CursorUsageError.totalUsageLimitMissing
         }
 
@@ -61,32 +145,44 @@ enum CursorUsageMapper {
         appendCredits(creditGrants: creditGrants, stripeBalanceCents: stripeBalanceCents, to: &lines)
 
         let planUsedCents = ProviderParse.number(planUsage["totalSpend"])
-            ?? ((ProviderParse.number(planUsage["limit"]) ?? 0) - (ProviderParse.number(planUsage["remaining"]) ?? 0))
-        let computedPercentUsed = ProviderParse.number(planUsage["limit"]).flatMap { limit -> Double? in
+            ?? ((facts.limit ?? 0) - (ProviderParse.number(planUsage["remaining"]) ?? 0))
+        let computedPercentUsed = facts.limit.flatMap { limit -> Double? in
             guard limit > 0 else { return nil }
             return planUsedCents / limit * 100
         } ?? 0
-        let totalUsagePercent = ProviderParse.number(planUsage["totalPercentUsed"]) ?? computedPercentUsed
+        let totalUsagePercent = facts.totalPercentUsed ?? computedPercentUsed
 
         let cycle = billingCycle(from: usage)
         let spendLimitUsage = usage["spendLimitUsage"] as? [String: Any]
-        let pooledLimit = ProviderParse.number(spendLimitUsage?["pooledLimit"]) ?? 0
-        let isTeamAccount = normalizedPlan == "team"
-            || (spendLimitUsage?["limitType"] as? String)?.lowercased() == "team"
-            || pooledLimit > 0
+        let isTeamAccount = normalizedPlan == "team" || facts.isTeamByShape
 
-        if isTeamAccount {
-            guard let limitCents = ProviderParse.number(planUsage["limit"]) else {
+        if isTeamAccount && facts.hasModelPools {
+            // Modern Teams seats still report the old $20 allowance. Structured pool data wins;
+            // never synthesize a total from stale dollars when Cursor omits totalPercentUsed.
+            if let percent = facts.totalPercentUsed {
+                lines.append(.progress(
+                    label: "Total usage", used: percent, limit: 100, format: .percent,
+                    resetsAt: cycle.resetsAt, periodDurationMs: cycle.periodDurationMs
+                ))
+            }
+        } else if isTeamAccount {
+            if let limitCents = facts.limit {
+                lines.append(.progress(
+                    label: "Total usage",
+                    used: ProviderParse.centsToDollars(planUsedCents),
+                    limit: ProviderParse.centsToDollars(limitCents),
+                    format: .dollars,
+                    resetsAt: cycle.resetsAt,
+                    periodDurationMs: cycle.periodDurationMs
+                ))
+            } else if let percent = facts.totalPercentUsed {
+                lines.append(.progress(
+                    label: "Total usage", used: percent, limit: 100, format: .percent,
+                    resetsAt: cycle.resetsAt, periodDurationMs: cycle.periodDurationMs
+                ))
+            } else {
                 throw CursorUsageError.requestBasedUnavailable("Cursor request-based usage data unavailable. Try again later.")
             }
-            lines.append(.progress(
-                label: "Total usage",
-                used: ProviderParse.centsToDollars(planUsedCents),
-                limit: ProviderParse.centsToDollars(limitCents),
-                format: .dollars,
-                resetsAt: cycle.resetsAt,
-                periodDurationMs: cycle.periodDurationMs
-            ))
         } else {
             lines.append(.progress(
                 label: "Total usage",
@@ -100,7 +196,7 @@ enum CursorUsageMapper {
 
         if let autoPercentUsed = ProviderParse.number(planUsage["autoPercentUsed"]) {
             lines.append(.progress(
-                label: "Auto usage",
+                label: "Cursor Models",
                 used: autoPercentUsed,
                 limit: 100,
                 format: .percent,
@@ -111,7 +207,7 @@ enum CursorUsageMapper {
 
         if let apiPercentUsed = ProviderParse.number(planUsage["apiPercentUsed"]) {
             lines.append(.progress(
-                label: "API usage",
+                label: "Other Models",
                 used: apiPercentUsed,
                 limit: 100,
                 format: .percent,
@@ -188,52 +284,80 @@ enum CursorUsageMapper {
         planName: String?,
         planInfoUnavailable: Bool
     ) -> (shouldFallback: Bool, message: String) {
-        guard usage["enabled"] as? Bool != false else {
+        let facts = CursorPlanUsageFacts(usage: usage)
+        guard facts.isEnabled else {
             return (false, "")
         }
 
-        let planUsage = usage["planUsage"] as? [String: Any]
-        let hasPlanUsage = planUsage != nil
-        let hasPlanUsageLimit = planUsage.flatMap { ProviderParse.number($0["limit"]) } != nil
-        let planUsageLimitMissing = hasPlanUsage && !hasPlanUsageLimit
-        let hasTotalUsagePercent = planUsage.flatMap { ProviderParse.number($0["totalPercentUsed"]) } != nil
         let normalizedPlan = planName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        let planUsageUnusable = !hasPlanUsage || planUsageLimitMissing
 
-        if planUsageUnusable && normalizedPlan == "enterprise" {
+        if facts.planUsageUnusable && !facts.hasTotalUsagePercent && normalizedPlan == "enterprise" {
             return (true, "Enterprise usage data unavailable. Try again later.")
         }
-        if planUsageUnusable && normalizedPlan == "team" {
+        if facts.planUsageUnusable && !facts.hasTotalUsagePercent && normalizedPlan == "team" {
             return (true, "Team request-based usage data unavailable. Try again later.")
         }
-        if planUsageUnusable && !hasTotalUsagePercent && normalizedPlan.isEmpty && planInfoUnavailable {
+        if facts.planUsageUnusable && !facts.hasTotalUsagePercent && normalizedPlan.isEmpty && planInfoUnavailable {
             return (true, "Cursor request-based usage data unavailable. Try again later.")
         }
 
-        let spendLimitUsage = usage["spendLimitUsage"] as? [String: Any]
-        let pooledLimit = ProviderParse.number(spendLimitUsage?["pooledLimit"]) ?? 0
-        let teamInferred = (spendLimitUsage?["limitType"] as? String)?.lowercased() == "team" || pooledLimit > 0
-        if teamInferred && planUsageLimitMissing {
+        if facts.isTeamByShape && facts.planUsageLimitMissing && !facts.hasModelPools {
             return (true, "Cursor request-based usage data unavailable. Try again later.")
         }
 
         return (false, "")
     }
 
-    /// Append the shared Today / Yesterday / Last 30 Days spend tiles from Cursor's CSV rows. The rows
+    /// Append the shared Today / Yesterday / Last 30 Days spend tiles from Cursor's usage-event rows. The rows
     /// are aggregated into one local-calendar-day `DailyUsageSeries` and handed to `SpendTileMapper`
     /// — the same builder the Claude/Codex/Grok tiles use — so the output is identical apart from the
-    /// `estimated: false` flag (Cursor spend is server-priced, so its dollars are not marked estimated). Callers only
-    /// invoke this when the CSV fetched and parsed, so a failure appends nothing and the tiles read
-    /// "No data".
-    static func appendSpendLines(rows: [CursorUsageCSVRow], now: Date, to lines: inout [MetricLine]) {
+    /// source note. Cursor's costs are calculated locally from the usage-event token counts, so the dollar
+    /// values carry the estimate icon. Callers only invoke this when usage history is complete, so a
+    /// failure appends nothing and the tiles read "No data".
+    ///
+    /// Model breakdown rows group by base model, not raw slug: Cursor reports one slug per thinking
+    /// effort / fast combination (`claude-opus-4-8-thinking-max`, `gpt-5.5-extra-high-fast`, …), and a
+    /// panel of near-duplicate rows hides the actual ranking. The supplement's alias rules already
+    /// collapse those slugs to a canonical pricing key, and `-fast` canonicals fold into their base, so
+    /// the family comes from the same machinery that prices the row (ported from cursorcat's
+    /// family grouping). The raw slugs survive as `variants` — the per-effort breakdown the row's
+    /// tooltip shows.
+    static func appendSpendLines(
+        rows: [CursorUsageRow],
+        now: Date,
+        pricing: ModelPricing,
+        to lines: inout [MetricLine]
+    ) -> ProviderUsageHistory {
         let calendar = Calendar.current
         var costByDay: [String: Double] = [:]
         var tokensByDay: [String: Int] = [:]
+        var modelsByDay: [String: [String: ModelAccumulator]] = [:]
+        // Rows no pricing source can price (nil imputed cost) are excluded from every displayed total —
+        // tokens, dollars, the trend, and the model breakdown — because mixing measured tokens with
+        // unpriceable ones makes the figures incoherent (a huge token count next to a dollar figure that
+        // ignores it). Their model names surface only through the warning triangle: track them per day so
+        // the spend tile can warn that its figures are incomplete. Only rows that actually spent tokens
+        // count — a 0-token row of an unknown model changes nothing, so it isn't worth flagging.
+        var unknownModelsByDay: [String: Set<String>] = [:]
         for row in rows {
-            let day = dayKey(from: row.date, calendar: calendar)
-            costByDay[day, default: 0] += row.imputedCostDollars
-            tokensByDay[day, default: 0] += row.tokens.total
+            let day = DailyUsageAccumulator.dayKey(from: row.date, calendar: calendar)
+            let model = row.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let cost = row.imputedCostDollars else {
+                if row.tokens.totalTokens > 0, !model.isEmpty {
+                    unknownModelsByDay[day, default: []].insert(model)
+                }
+                continue
+            }
+            costByDay[day, default: 0] += cost
+            tokensByDay[day, default: 0] += row.tokens.totalTokens
+            let modelName = model.isEmpty ? ModelUsageEntry.unattributedModelName : model
+            // `-fast` folds into the base family (`gpt-5.5-extra-high-fast` -> `gpt-5.5-fast` -> `gpt-5.5`).
+            let family = model.isEmpty ? modelName : pricing.familyName(for: model, stripping: ["-fast"])
+            modelsByDay[day, default: [:]][family, default: ModelAccumulator()].add(
+                variant: modelName,
+                tokens: row.tokens.totalTokens,
+                costUSD: cost
+            )
         }
 
         // Sum raw dollars per day, then snap to whole cents once — rounding per row would accumulate
@@ -242,27 +366,61 @@ enum CursorUsageMapper {
             DailyUsageEntry(
                 date: day,
                 totalTokens: tokensByDay[day] ?? 0,
-                costUSD: Double(CursorPricing.toCents(costByDay[day] ?? 0)) / 100
+                costUSD: ((costByDay[day] ?? 0) * 100).rounded() / 100
             )
         }
         let series = DailyUsageSeries(daily: daily)
-        SpendTileMapper.appendTokenUsage(series, to: &lines, now: now, estimated: false)
-        // Cursor's tokens come from the server-priced usage CSV, not a local CLI log, so the trend
-        // note names that source rather than the "estimated from local logs" line the ccusage/Grok
+        let modelUsage = ModelUsageSeries(daily: modelsByDay.keys.sorted(by: >).map { day in
+            DailyModelUsageEntry(
+                date: day,
+                models: modelsByDay[day, default: [:]].map { model, accumulator in
+                    accumulator.entry(model: model)
+                }
+            )
+        })
+        SpendTileMapper.appendTokenUsage(series, to: &lines, now: now, estimated: true,
+                                         unknownModelsByDay: unknownModelsByDay,
+                                         modelUsage: modelUsage,
+                                         modelSourceNote: "From your Cursor usage history")
+        // Cursor's tokens come from the server usage history, not a local CLI log, so the trend
+        // note names that source rather than the "estimated from local logs" line the log-scanning
         // providers use. Tokens are measured either way.
         SpendTileMapper.appendUsageTrend(series, to: &lines, now: now, note: "From your Cursor usage history")
+        return ProviderUsageHistory(
+            series: series,
+            modelUsage: modelUsage,
+            unknownModelsByDay: unknownModelsByDay
+        )
     }
 
-    private static func dayKey(from date: Date, calendar: Calendar) -> String {
-        let components = calendar.dateComponents([.year, .month, .day], from: date)
-        return String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
+    private struct ModelAccumulator {
+        var tokens = 0
+        var costUSD: Double?
+        var variants: [String: (tokens: Int, costUSD: Double?)] = [:]
+
+        mutating func add(variant: String, tokens: Int, costUSD: Double?) {
+            self.tokens += tokens
+            if let costUSD {
+                self.costUSD = (self.costUSD ?? 0) + costUSD
+            }
+            let existing = variants[variant] ?? (0, nil)
+            let combinedCost: Double? = costUSD.map { (existing.costUSD ?? 0) + $0 } ?? existing.costUSD
+            variants[variant] = (existing.tokens + tokens, combinedCost)
+        }
+
+        func entry(model: String) -> ModelUsageEntry {
+            // A single variant with the family's own name is not a breakdown — leave `variants` nil so
+            // the hover tooltip falls back to plain figures.
+            let list = variants.map { ModelUsageVariant(model: $0.key, totalTokens: $0.value.tokens, costUSD: $0.value.costUSD) }
+            let isTrivial = list.count == 1 && list[0].model == model
+            return ModelUsageEntry(model: model, totalTokens: tokens, costUSD: costUSD,
+                                   variants: isTrivial ? nil : list)
+        }
     }
 
-    static func stripeBalanceCents(from response: HTTPResponse?) -> Double {
-        guard let response,
-              (200..<300).contains(response.statusCode),
-              let stripe = ProviderParse.jsonObject(response.body),
-              let balance = ProviderParse.number(stripe["customerBalance"]),
+    static func stripeBalanceCents(from body: [String: Any]?) -> Double {
+        guard let body,
+              let balance = ProviderParse.number(body["customerBalance"]),
               balance < 0
         else {
             return 0
@@ -298,6 +456,60 @@ enum CursorUsageMapper {
             Date(timeIntervalSince1970: cycleEnd / 1000),
             Int(cycleEnd - cycleStart)
         )
+    }
+
+    /// Membership values that identify an org-billed Cursor seat.
+    static let orgMembershipTypes: Set<String> = ["enterprise", "team"]
+
+    /// Plan name for request/Enterprise fallback routing. Org membership may promote the route,
+    /// but personal memberships must not fill an empty GetPlanInfo result and disable the
+    /// unknown-plan REST fallback.
+    static func routingPlanName(planInfoName: String?, membershipType: String?) -> String? {
+        let membership = normalizedMembership(membershipType)
+        if let membership, orgMembershipTypes.contains(membership) {
+            return membership
+        }
+        return planInfoName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+    }
+
+    /// Badge / display plan. Prefer org billing membership over GetPlanInfo when it still says Pro.
+    static func resolvedPlanName(planInfoName: String?, membershipType: String?) -> String? {
+        let membership = normalizedMembership(membershipType)
+        let planInfo = planInfoName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        if let membership, orgMembershipTypes.contains(membership),
+           planInfo == nil || ["pro", "pro plan"].contains(planInfo?.lowercased() ?? "") {
+            return membership
+        }
+        return planInfo ?? membership
+    }
+
+    static func resolvedPlanLabel(planInfoName: String?, membershipType: String?) -> String? {
+        planLabel(resolvedPlanName(planInfoName: planInfoName, membershipType: membershipType))
+    }
+
+    /// Prefer local org membership when present; otherwise take a live org membership from
+    /// usage-summary over a stale local personal membership.
+    static func preferredMembership(local: String?, summary: String?) -> String? {
+        let localMembership = normalizedMembership(local)
+        let summaryMembership = normalizedMembership(summary)
+        if let localMembership, orgMembershipTypes.contains(localMembership) {
+            return localMembership
+        }
+        if let summaryMembership, orgMembershipTypes.contains(summaryMembership) {
+            return summaryMembership
+        }
+        return localMembership ?? summaryMembership
+    }
+
+    private static func normalizedMembership(_ value: String?) -> String? {
+        value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .nilIfEmpty
     }
 
     private static func planLabel(_ value: String?) -> String? {

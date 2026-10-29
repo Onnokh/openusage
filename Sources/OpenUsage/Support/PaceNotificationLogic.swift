@@ -46,8 +46,8 @@ extension PaceMilestone {
 
 /// The pace-severity bucket a metric is in, derived from its `MeterState`. Only the three live-pace
 /// verdicts (and the terminal `spent`) carry a comparable severity; states with no trustworthy pace
-/// (`noData`, absolute-band `level`, and a fresh session window) are `untracked` — they neither fire a
-/// milestone nor count as an improvement, so they can't reset a fired flag either.
+/// (`noData`, absolute-band `level`, and a fresh session window) are `untracked` for pace milestones.
+/// A `.level` metric may still fire the independent remaining-based Almost Out milestone.
 enum PaceBucket: Hashable, Sendable {
     /// No pace story to act on (no data, plain level band, or a not-yet-started session window).
     case untracked
@@ -77,14 +77,11 @@ struct NotificationState: Equatable, Sendable {
     var primed: Bool = false
 }
 
-/// Which per-milestone toggles are currently on. The master toggle is applied by the caller before
-/// this runs; this struct only carries the three individual switches.
+/// Which of the three independent per-milestone toggles are currently on.
 struct PaceNotificationToggles: Sendable {
     var underTenPercent: Bool
     var healthyToClose: Bool
     var closeToRunningOut: Bool
-
-    static let allOn = PaceNotificationToggles(underTenPercent: true, healthyToClose: true, closeToRunningOut: true)
 
     func isOn(_ milestone: PaceMilestone) -> Bool {
         switch milestone {
@@ -106,7 +103,8 @@ enum PaceNotificationLogic {
     }
 
     /// Maps a meter state to its pace bucket. The "no trustworthy pace" states (no data, fresh
-    /// session, absolute level bands) are `untracked` — they never fire and never reset flags.
+    /// session, absolute level bands) are `untracked` for pace milestones; `.level` may still fire the
+    /// independent remaining-based Almost Out milestone.
     static func bucket(for state: WidgetData.MeterState) -> PaceBucket {
         switch state {
         case .noData, .level: return .untracked
@@ -119,14 +117,17 @@ enum PaceNotificationLogic {
     /// Decide which milestones to fire for one metric this pass, and the state to persist.
     ///
     /// Rules:
-    /// - A new reset window (a later `resetsAt`) clears the fired set so milestones can fire again.
+    /// - A new reset window (a meaningfully later `resetsAt`) clears the fired set so milestones can fire
+    ///   again. Provider timestamps can jitter by milliseconds between refreshes, so tiny differences are
+    ///   treated as the same reset window for notification dedupe.
     /// - `healthyToClose` / `closeToRunningOut` fire only on a worsening *edge* between adjacent
     ///   buckets, only if not already fired this window, and only if their toggle is on.
     /// - `underTenPercent` fires the first time remaining crosses under 10% this window; recovering
     ///   above 10% re-arms it so a later dip re-fires.
-    /// - `untracked` states (no data, fresh session, level bands) suppress everything — they carry no
-    ///   trustworthy pace — and don't disturb the recorded "previous" signals, so a momentary gap
-    ///   (e.g. a failed refresh) doesn't spuriously re-fire when real data returns.
+    /// - `untracked` states carry no trustworthy pace and therefore suppress pace milestones. No data
+    ///   suppresses everything; `.level` can still fire Almost Out from its remaining share. Neither
+    ///   disturbs the recorded pace signals, so a momentary gap does not spuriously re-fire when real
+    ///   pace data returns.
     /// - Improving pace clears the relevant fired flags so a later worsening re-fires.
     static func transitions(
         state: WidgetData.MeterState,
@@ -139,9 +140,9 @@ enum PaceNotificationLogic {
     ) -> Transition {
         var next = previous
 
-        // New window: reset dedup. A nil-or-equal reset keeps the window; a strictly later reset (or a
-        // reset appearing where there was none) starts fresh.
-        if let resetsAt, previous.resetsAt == nil || resetsAt > (previous.resetsAt ?? .distantPast) {
+        // New window: reset dedup. A nil-or-equal reset keeps the window; a reset appearing where there
+        // was none or moving later by more than the jitter tolerance starts fresh.
+        if resetWindowAdvanced(resetsAt: resetsAt, previousReset: previous.resetsAt) {
             next.firedMilestones = []
             next.wasUnderTenPercent = false
             next.previousBucket = .untracked
@@ -246,5 +247,15 @@ enum PaceNotificationLogic {
         case .close: return 1
         case .runningOut: return 2
         }
+    }
+
+    /// Reset timestamps can carry provider-side millisecond jitter. For notification dedupe, only a
+    /// meaningful advance re-arms milestones; the UI can still display the exact provider timestamp.
+    static let resetWindowJitterTolerance: TimeInterval = 1
+
+    static func resetWindowAdvanced(resetsAt: Date?, previousReset: Date?) -> Bool {
+        guard let resetsAt else { return false }
+        guard let previousReset else { return true }
+        return resetsAt.timeIntervalSince(previousReset) > resetWindowJitterTolerance
     }
 }

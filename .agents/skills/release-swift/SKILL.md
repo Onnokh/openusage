@@ -22,7 +22,10 @@ Next number in the current lane (default bump: patch). Beta builds add a `-beta.
 
 ### 2. Generate the changelog
 
-Collect commits since the previous tag and categorize each:
+Collect commits since the **previous release in the same channel** and categorize each:
+
+- **Stable cut:** span from the **last stable tag** to this one (e.g. `v0.7.0...v0.7.1`), so the notes roll up the entire beta series plus any post-beta commits. Never start a stable changelog at the last beta — that would omit every beta in the lane.
+- **Beta cut:** span from the previous tag (the prior beta, or the last stable if it's the first beta in a lane) to this one.
 
 | Commit prefix | Category |
 |---|---|
@@ -79,7 +82,10 @@ Never leave a release blank.
 gh release view v{version} --json isDraft,isPrerelease,assets,body \
   --jq '{isDraft, isPrerelease, assets:[.assets[].name], bodyLen:(.body|length)}'
 git fetch origin gh-pages && git show origin/gh-pages:appcast.xml | grep -F "OpenUsage-{version}.dmg"
+curl -s "https://robinebers.github.io/openusage/appcast.xml" | grep -F "OpenUsage-{version}.dmg"
 ```
+
+The second check matters: publishing is two hops — Release (or pricing-supplement) pushes `appcast.xml` to the **`gh-pages` branch**, then **`.github/workflows/deploy-pages.yml` on `main`** deploys that branch to the live site (Pages source is "GitHub Actions", not legacy branch deploy). Auto deploy runs on `workflow_run` after Release completes; GitHub sometimes returns **"Deployment failed, try again later"** even though `gh-pages` is already correct. If the branch has the version but the live URL does not after ~10 minutes, check `gh run list --workflow=deploy-pages.yml` and re-run **`gh workflow run deploy-pages.yml --ref main`** (must use `main` — the workflow file is not on `gh-pages`). Sparkle clients only see the live URL.
 
 Require `isDraft=false`, `isPrerelease=true` for beta or `false` for stable, an `OpenUsage-<version>.dmg` asset, `bodyLen>0`, and the version present in the appcast. If a draft was left behind, migrate its notes/assets onto the published release, then delete it — but only once a separate PUBLISHED release for the tag already exists:
 
@@ -121,9 +127,12 @@ Only include category sections that have entries.
 - [{short_hash}](https://github.com/robinebers/openusage/commit/{full_hash}) {commit message} by @{author}
 ~~~
 
+`{prev_tag}` is the previous release **in the same channel**: last stable for a stable cut, last beta (or last stable for the first beta in a lane) for a beta cut.
+
 ## Rules
 
 - 7-char short commit hashes; tags always prefixed with `v`.
+- Stable changelogs span last-stable → this-stable (roll up the whole beta series); beta changelogs span previous-tag → this-beta.
 - Never push or tag automatically — ask the owner first.
 - Always publish notes to the GitHub Release — never blank.
 - The version is the tag; never edit version files.

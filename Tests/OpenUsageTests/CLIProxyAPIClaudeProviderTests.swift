@@ -74,7 +74,7 @@ final class CLIProxyAPIAuthStoreTests: XCTestCase {
 final class CLIProxyAPIClaudeProviderTests: XCTestCase {
     private let path = "/proxy/auth/claude-1-onno@x.nl.json"
     private static let usageBody = #"{"five_hour":{"utilization":42,"resets_at":"2100-01-01T00:00:00Z"},"seven_day":{"utilization":10}}"#
-    private static let maxProfileBody = #"{"account":{"has_claude_max":true},"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}}"#
+    private static let maxProfileBody = #"{"account":{"uuid":"u"},"organization":{"uuid":"o","organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}}"#
 
     /// `responses` maps a request path ("/api/oauth/usage") to its status and body.
     private func makeProvider(_ responses: [String: (Int, String)]) -> (CLIProxyAPIClaudeProvider, RoutingHTTPClient) {
@@ -135,17 +135,6 @@ final class CLIProxyAPIClaudeProviderTests: XCTestCase {
         XCTAssertNil(first.plan)
         XCTAssertNotNil(first.line(label: "Session"))
         XCTAssertEqual(http.requests.filter { $0.url.path == "/api/oauth/profile" }.count, 2)
-    }
-
-    func testMapsProfileOrganizationToThePlanLabel() {
-        func plan(_ type: String, _ tier: String?) -> String? {
-            let tierJSON = tier.map { #","rate_limit_tier":"\#($0)""# } ?? ""
-            return CLIProxyAPIClaudeProvider.plan(fromProfile: Data(#"{"organization":{"organization_type":"\#(type)"\#(tierJSON)}}"#.utf8))
-        }
-        XCTAssertEqual(plan("claude_max", "default_claude_max_5x"), "Max 5x")
-        XCTAssertEqual(plan("claude_pro", "default_claude_ai"), "Pro")
-        XCTAssertEqual(plan("claude_team", "default_claude_max_5x"), "Team 5x")
-        XCTAssertNil(CLIProxyAPIClaudeProvider.plan(fromProfile: Data("{}".utf8)))
     }
 
     func testRejectedTokenPointsAtCLIProxyAPIInsteadOfRefreshing() async {

@@ -22,10 +22,15 @@ enum DevinUsageMapper {
         let planStatus = userStatus["planStatus"] as? [String: Any] ?? [:]
         let planInfo = planStatus["planInfo"] as? [String: Any] ?? [:]
         let plan = readTrimmedString(planInfo["planName"]) ?? "Unknown"
-        let hideDailyQuota = readBool(planInfo["hideDailyQuota"]) == true
+        let hideDailyQuota = ProviderParse.bool(planInfo["hideDailyQuota"]) == true
 
         let dailyRemaining = ProviderParse.number(planStatus["dailyQuotaRemainingPercent"])
         let weeklyRemaining = ProviderParse.number(planStatus["weeklyQuotaRemainingPercent"])
+        // A present-but-unparsable percentage is schema drift, not an omitted zero: fail loudly
+        // instead of letting the exhausted-quota fallback below turn it into a credible 100% used.
+        if planStatus["weeklyQuotaRemainingPercent"] != nil, weeklyRemaining == nil {
+            throw DevinUsageError.invalidResponse
+        }
         let dailyReset = hideDailyQuota ? nil : unixSecondsToDate(planStatus["dailyQuotaResetAtUnix"])
         let weeklyReset = unixSecondsToDate(planStatus["weeklyQuotaResetAtUnix"])
         let extraUsageBalance = dollarsFromMicros(planStatus["overageBalanceMicros"])
@@ -41,7 +46,8 @@ enum DevinUsageMapper {
             ))
         }
 
-        if let weeklyRemaining {
+        // Proto3 JSON omits zero values. A weekly reset identifies an existing weekly window.
+        if let weeklyRemaining = weeklyRemaining ?? (weeklyReset != nil ? 0 : nil) {
             lines.append(quotaLine(
                 label: "Weekly quota",
                 remaining: weeklyRemaining,
@@ -50,7 +56,7 @@ enum DevinUsageMapper {
             ))
         } else if hideDailyQuota,
                   let dailyRemaining {
-            // No weekly quota in the response: surface the (hidden) daily quota in the Weekly row so
+            // No weekly percentage or reset in the response: surface the hidden daily quota so
             // the tile stays meaningful. Still flipped from remaining→used, just like every quota row.
             lines.append(quotaLine(
                 label: "Weekly quota",
@@ -102,21 +108,6 @@ enum DevinUsageMapper {
         guard let string = value as? String else { return nil }
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func readBool(_ value: Any?) -> Bool? {
-        if let bool = value as? Bool { return bool }
-        if let string = value as? String {
-            switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "true":
-                return true
-            case "false":
-                return false
-            default:
-                return nil
-            }
-        }
-        return nil
     }
 }
 

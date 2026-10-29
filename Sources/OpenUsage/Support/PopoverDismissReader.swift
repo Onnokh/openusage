@@ -1,63 +1,6 @@
 import SwiftUI
 import AppKit
 
-/// Reports whether the hosting menu-bar popover is actually on-screen, via the window's occlusion
-/// state.
-///
-/// Why occlusion and not key/focus: the popover keeps its SwiftUI view tree alive across
-/// open/close, so transient UI state (edit mode, the add-widget gallery) would otherwise
-/// persist and reopen "stuck". We need a signal for "the popover went away" — but it must NOT fire
-/// when the user merely clicks a control inside the popover. Key/resign-key fires on those clicks
-/// (breaking buttons); occlusion does not. Occlusion flips to not-`visible` when the popover is
-/// dismissed (its window orders out), which is exactly the moment we want to reset.
-struct PopoverVisibilityReader: NSViewRepresentable {
-    var onChange: (Bool) -> Void
-
-    func makeNSView(context: Context) -> NSView {
-        let view = VisibilityView()
-        view.onChange = onChange
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        (nsView as? VisibilityView)?.onChange = onChange
-    }
-
-    final class VisibilityView: NSView {
-        var onChange: ((Bool) -> Void)?
-        private var observer: NSObjectProtocol?
-        private var lastVisible: Bool?
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if let observer {
-                NotificationCenter.default.removeObserver(observer)
-                self.observer = nil
-            }
-            guard let window else {
-                report(false)
-                return
-            }
-            observer = NotificationCenter.default.addObserver(
-                forName: NSWindow.didChangeOcclusionStateNotification,
-                object: window,
-                queue: .main
-            ) { [weak self, weak window] _ in
-                MainActor.assumeIsolated {
-                    self?.report(window?.occlusionState.contains(.visible) ?? false)
-                }
-            }
-            report(window.occlusionState.contains(.visible))
-        }
-
-        private func report(_ visible: Bool) {
-            guard lastVisible != visible else { return }
-            lastVisible = visible
-            onChange?(visible)
-        }
-    }
-}
-
 /// Handles the popover's two bare navigation keys via a local key monitor. SwiftUI
 /// `.keyboardShortcut` is unreliable here — a hidden/zero-size shortcut button never registers, and
 /// even a visible default button only fires when the popover is the key window — so the popover's
@@ -66,10 +9,10 @@ struct PopoverVisibilityReader: NSViewRepresentable {
 ///
 /// - **Esc**: `onEscape` gets first refusal (e.g. backing out of Customize); when it declines, the
 ///   popover is dismissed through `MenuBarPopover.dismiss`, the same path a status-item click takes
-///   — so it stays in sync, reopens in one click, and trips the visibility reset (cancelling edit
-///   mode + the jiggle).
-/// - **Return**: `onReturn` opens/closes Customize (the same affordance the footer's Customize
-///   button carries). Consuming the key here is also what stops a bare
+///   — so it stays in sync, reopens in one click, and trips the controller's visibility reset
+///   (cancelling edit mode + the jiggle).
+/// - **Return**: `onReturn` navigates into or back out of Customize (the same affordance the footer's
+///   Options ▸ Customize item carries). Consuming the key here is also what stops a bare
 ///   Return from falling through and dismissing the popover.
 struct PopoverKeyReader: NSViewRepresentable {
     /// Called first on Esc. Return `true` when the press was handled in-popover (Esc then does
@@ -79,8 +22,8 @@ struct PopoverKeyReader: NSViewRepresentable {
     /// `false` lets the key fall through to a focused control.
     var onReturn: @MainActor () -> Bool = { false }
     /// Called on ⌘, (Settings). Handled on this always-on monitor — the same one as Esc/Return — so it
-    /// works from every screen, including Settings, which has no footer to host a SwiftUI shortcut. The
-    /// More menu's Settings item carries ⌘, only as a *label*: while that menu is open the item handles
+    /// works from every screen, including Settings, whose footer has no Settings action. The Options
+    /// menu's Settings item carries ⌘, only as a *label*: while that menu is open the item handles
     /// it, while it's closed this monitor does, so they never both fire.
     var onSettings: @MainActor () -> Bool = { false }
     /// Called on plain ⌘Z (undo). Rides this monitor — same reasons as Esc/Return: a hidden SwiftUI
@@ -109,7 +52,7 @@ struct PopoverKeyReader: NSViewRepresentable {
 
     /// Whether a bare-key keyDown belongs to the popover: its key window must *be* the panel. The
     /// panel is a non-activating key window that takes focus the instant it opens, so a foreign key
-    /// window (an open About panel, a tracking `NSMenu` from the More menu or a Settings picker) — or
+    /// window (an open About panel, a tracking `NSMenu` from the Options menu or a Settings picker) — or
     /// no key window at all — is correctly *not* the popover's, and Esc/Return leave it alone instead
     /// of hijacking it. (An earlier build also claimed a nil key window, to paper over `NSPopover`'s
     /// activation race; the `NSPanel` removed that race, so the strict match is correct and safer.)
@@ -171,7 +114,7 @@ struct PopoverKeyReader: NSViewRepresentable {
                     guard let self, let window = self.window, window.isVisible else { return false }
                     // The key must target the popover — its key window must be the panel, so a key
                     // pressed while a menu / About panel owns focus is left alone (see `keyTargetsPopover`).
-                    // This is also what hands ⌘, to an open More menu's own item instead of here.
+                    // This is also what hands ⌘, to an open Options menu's own item instead of here.
                     guard PopoverKeyReader.keyTargetsPopover(
                         eventWindowID: eventWindowID,
                         popoverWindowID: ObjectIdentifier(window)
@@ -209,6 +152,10 @@ enum MenuBarPopover {
     /// path as a status-item click.
     static var dismissHandler: (() -> Void)?
 
+    /// Installed by `StatusItemController` at launch; opens the popover (e.g. when the user taps a
+    /// quota pace notification banner).
+    static var showHandler: (() -> Void)?
+
     /// Auto-resize bridge — the "single clock". SwiftUI owns the animated height and the AppKit panel
     /// is a passive follower: `applyHeight` is called once per animation frame from a SwiftUI
     /// `Animatable` modifier with the interpolated height, and the controller hops it onto the main
@@ -228,5 +175,9 @@ enum MenuBarPopover {
         } else {
             window?.orderOut(nil)
         }
+    }
+
+    static func show() {
+        showHandler?()
     }
 }

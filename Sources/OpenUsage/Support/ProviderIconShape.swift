@@ -1,9 +1,13 @@
 import SwiftUI
 
-/// Where a tile/gallery icon comes from: a copied provider vector mark, or an SF Symbol.
-enum IconSource: Hashable {
-    case providerMark(String)   // provider id, e.g. "claude"
-    case symbol(String)         // SF Symbol name
+/// A provider's copied vector mark, keyed by provider id.
+struct IconSource: Hashable {
+    let providerID: String
+
+    /// Named constructor retained at call sites so the stored string's meaning stays explicit.
+    static func providerMark(_ providerID: String) -> IconSource {
+        IconSource(providerID: providerID)
+    }
 }
 
 /// Renders an `IconSource` in monochrome (`Theme.iconGray`): on the glass popover, icon color
@@ -17,17 +21,11 @@ struct ProviderIcon: View {
     var inset: CGFloat = 0.14
 
     var body: some View {
-        switch source {
-        case .providerMark(let id):
-            if let mark = ProviderMarks.mark(for: id) {
-                ProviderIconShape(pathData: mark.path, inset: inset)
-                    .fill(Theme.iconGray)
-            } else {
-                Image(systemName: ProviderMarks.symbolFallback(for: id))
-                    .foregroundStyle(Theme.iconGray)
-            }
-        case .symbol(let name):
-            Image(systemName: name)
+        if let mark = ProviderMarks.mark(for: source.providerID) {
+            ProviderIconShape(mark: mark, inset: inset)
+                .fill(Theme.iconGray)
+        } else {
+            Image(systemName: ProviderMarks.symbolFallback(for: source.providerID))
                 .foregroundStyle(Theme.iconGray)
         }
     }
@@ -40,13 +38,13 @@ struct ProviderIcon: View {
 /// run edge-to-edge (Devin, Grok). Fitting the real path bounds gives every provider mark the same
 /// optical weight, then a single shared `inset` adds consistent breathing room so none touch the edge.
 struct ProviderIconShape: Shape {
-    let pathData: String
+    let mark: ProviderMark
     /// Fraction of the frame kept as margin on every side, so normalized marks have uniform padding.
     var inset: CGFloat = 0.14
 
     func path(in rect: CGRect) -> Path {
-        let raw = SVGPath.parse(pathData)
-        let bounds = raw.cgPath.boundingBoxOfPath
+        let raw = mark.parsedPath
+        let bounds = mark.bounds
         guard bounds.width > 0, bounds.height > 0 else { return raw }
         let target = rect.insetBy(dx: rect.width * inset, dy: rect.height * inset)
         let scale = min(target.width / bounds.width, target.height / bounds.height)
@@ -60,8 +58,17 @@ struct ProviderIconShape: Shape {
 
 /// A provider vector mark: the combined SVG path data. `ProviderIconShape` normalizes by the path's
 /// true bounding box, so the source `viewBox` isn't needed.
-struct ProviderMark: Hashable {
+struct ProviderMark {
     let path: String
+    let parsedPath: Path
+    let bounds: CGRect
+
+    init(path: String) {
+        self.path = path
+        let parsedPath = SVGPath.parse(path)
+        self.parsedPath = parsedPath
+        self.bounds = parsedPath.cgPath.boundingBoxOfPath
+    }
 }
 
 /// Loads copied provider SVGs from the bundle and extracts their path data (cached).
@@ -93,7 +100,10 @@ enum ProviderMarks {
         case "codex": return "circle.hexagongrid"
         case "cursor": return "cube"
         case "grok": return "bolt.fill"
+        case "ollama": return "cloud"
+        case "opencode": return "chevron.left.forwardslash.chevron.right"
         case "openrouter": return "point.3.connected.trianglepath.dotted"
+        case "zai": return "z.signal"
         default: return "app.dashed"
         }
     }

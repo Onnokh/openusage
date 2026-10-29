@@ -79,6 +79,13 @@ jobs:
           printf '%s' "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle_ed_private_key"
           echo "SPARKLE_PRIVATE_KEY_FILE=$RUNNER_TEMP/sparkle_ed_private_key" >> "$GITHUB_ENV"
 
+      - name: Write iCloud provisioning profile
+        env:
+          ICLOUD_PROFILE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_ICLOUD_PROFILE }}
+        run: |
+          printf '%s' "$ICLOUD_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/openusage-icloud.provisionprofile"
+          echo "ICLOUD_PROVISIONING_PROFILE=$RUNNER_TEMP/openusage-icloud.provisionprofile" >> "$GITHUB_ENV"
+
       - name: Carry forward the existing appcast
         run: |
           # generate_appcast works on a folder: it reads the existing appcast.xml there and the new DMG,
@@ -136,7 +143,8 @@ jobs:
           npm install -g @posthog/cli
           # Symbolication matches a crash report to its symbols by the binary's Mach-O UUID (carried in
           # the dSYM), so `--directory` is all that's required — no per-release flags to keep in sync.
-          posthog-cli dsym upload --directory dist/dSYMs
+          # A stable cut rebuilds its beta's code, so its UUIDs are already uploaded; skip those.
+          posthog-cli dsym upload --directory dist/dSYMs --skip-on-conflict
 
       - name: Publish DMG to GitHub Releases
         uses: softprops/action-gh-release@v3
@@ -210,3 +218,6 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_branch: gh-pages
           publish_dir: ./public
+          # gh-pages also hosts pricing_supplement.json (see pricing-supplement.yml). Without
+          # keep_files, publishing the appcast would delete it from the branch.
+          keep_files: true

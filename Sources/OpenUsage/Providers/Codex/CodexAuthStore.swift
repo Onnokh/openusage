@@ -1,3 +1,5 @@
+import CryptoKit
+import Darwin
 import Foundation
 
 struct CodexTokens: Codable, Hashable, Sendable {
@@ -26,14 +28,28 @@ struct CodexAuth: Codable, Hashable, Sendable {
     }
 }
 
+struct CodexPiCredentialSource: Hashable, Sendable {
+    let path: String
+    let providerID: String
+}
+
 struct CodexAuthState: Hashable, Sendable {
     enum Source: Hashable, Sendable {
         case file(path: String)
-        case keychain
+        case keychain(account: String)
+        case pi(CodexPiCredentialSource)
     }
 
     var auth: CodexAuth
     var source: Source
+    var readOnly: Bool = false
+
+    /// Whether this candidate carries a non-empty OAuth access token — the same bar `refresh()`'s
+    /// probe requires before fetching usage (an API-key-only auth.json can't serve the usage API).
+    /// `hasLocalCredentials()`'s first-run detection checks this, so the two can never drift.
+    var hasUsableAccessToken: Bool {
+        auth.tokens?.accessToken?.isEmpty == false
+    }
 }
 
 enum CodexAuthError: Error, LocalizedError, Equatable {
@@ -80,38 +96,48 @@ struct CodexAuthStore: Sendable {
     /// the `codex` CLI itself uses, so OpenUsage rotates on the same schedule rather than guessing.
     static let accessTokenRefreshWindow: TimeInterval = 5 * 60
     private static let authFile = "auth.json"
-    private static let defaultAuthHomes = ["~/.config/codex", "~/.codex"]
 
     var environment: EnvironmentReading
     var files: TextFileAccessing
     var keychain: KeychainAccessing
     var now: @Sendable () -> Date
+    var expectedIdentity: CodexAccountIdentity?
+    var additionalAuthHomes: [String]
+    /// Canonical homes (see `CodexHomeScanner.canonicalHome`) whose tokens this store may rotate and
+    /// write back. Empty for the plain card, which writes wherever it reads.
+    var writableAuthHomes: Set<String>
+    var piCredentialSources: [CodexPiCredentialSource]
 
     init(
         environment: EnvironmentReading = ProcessEnvironmentReader(),
         files: TextFileAccessing = LocalTextFileAccessor(),
         keychain: KeychainAccessing = SecurityKeychainAccessor(),
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        expectedIdentity: CodexAccountIdentity? = nil,
+        additionalAuthHomes: [String] = [],
+        writableAuthHomes: Set<String> = [],
+        piCredentialSources: [CodexPiCredentialSource] = []
     ) {
         self.environment = environment
         self.files = files
         self.keychain = keychain
         self.now = now
+        self.expectedIdentity = expectedIdentity
+        self.additionalAuthHomes = additionalAuthHomes
+        self.writableAuthHomes = writableAuthHomes
+        self.piCredentialSources = piCredentialSources
     }
 
-    func loadAuthCandidates() -> ([CodexAuthState], [String]) {
-        var candidates: [CodexAuthState] = []
-        var missing: [String] = []
+    func loadAuthCandidates() -> [CodexAuthState] {
+        authPaths().compactMap { loadAuth(at: $0) }
+            + piCredentialSources.compactMap(loadPiAuth)
+    }
 
-        for path in authPaths() {
-            if let state = loadAuth(at: path) {
-                candidates.append(state)
-            } else if !files.exists(path) {
-                missing.append(path)
-            }
-        }
-
-        return (candidates, missing)
+    func loadPiAuth(_ source: CodexPiCredentialSource) -> CodexAuthState? {
+        guard let auth = PiCodexLoginScanner.loadAuth(
+            files: files, path: source.path, providerID: source.providerID
+        ) else { return nil }
+        return scoped(CodexAuthState(auth: auth, source: .pi(source), readOnly: true))
     }
 
     /// Reads the credential from a single on-disk auth file — the targeted counterpart to
@@ -126,20 +152,28 @@ struct CodexAuthStore: Sendable {
         else {
             return nil
         }
-        return CodexAuthState(auth: auth, source: .file(path: path))
+        return scoped(CodexAuthState(auth: auth, source: .file(path: path)))
     }
 
     func loadKeychainAuth() -> CodexAuthState? {
-        guard let value = try? keychain.readGenericPassword(service: Self.keychainService),
+        loadKeychainAuth(account: Self.keychainAccount(codexHome: codexHome() ?? "~/.codex"))
+    }
+
+    /// Reload the same item even if the configured home or its symlink target has since changed.
+    func loadKeychainAuth(account: String) -> CodexAuthState? {
+        guard let value = try? keychain.readGenericPassword(service: Self.keychainService, account: account),
               let auth = Self.parseAuth(value),
               Self.hasTokenLikeAuth(auth)
         else {
             return nil
         }
-        return CodexAuthState(auth: auth, source: .keychain)
+        return scoped(CodexAuthState(auth: auth, source: .keychain(account: account)))
     }
 
-    func save(_ state: CodexAuthState) throws {
+    /// Writes `state` back to its source. With `replacing`, a file is written only while it still holds
+    /// exactly that credential, so a login Codex rotated moments earlier is never overwritten.
+    func save(_ state: CodexAuthState, replacing onDisk: CodexAuthState? = nil) throws {
+        guard !state.readOnly else { throw CodexAuthError.tokenConflict }
         let encoder = JSONEncoder()
         encoder.outputFormatting = state.source.isFile ? [.prettyPrinted, .sortedKeys] : []
         let data = try encoder.encode(state.auth)
@@ -149,9 +183,12 @@ struct CodexAuthStore: Sendable {
 
         switch state.source {
         case .file(let path):
+            if let onDisk, loadAuth(at: path) != onDisk { throw CodexAuthError.tokenConflict }
             try files.writeText(path, text)
-        case .keychain:
-            try keychain.writeGenericPassword(service: Self.keychainService, value: text)
+        case .keychain(let account):
+            try keychain.writeGenericPassword(service: Self.keychainService, account: account, value: text)
+        case .pi:
+            throw CodexAuthError.tokenConflict
         }
     }
 
@@ -185,10 +222,13 @@ struct CodexAuthStore: Sendable {
     }
 
     func authPaths() -> [String] {
-        if let codexHome = codexHome() {
-            return [joinPath(codexHome, Self.authFile)]
+        let homes = CodexHomeScanner.configuredHomeValues(environment: environment) + additionalAuthHomes
+        var seen = Set<String>()
+        return homes.compactMap { home in
+            let path = joinPath(home, Self.authFile)
+            let key = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+            return seen.insert(key).inserted ? path : nil
         }
-        return Self.defaultAuthHomes.map { joinPath($0, Self.authFile) }
     }
 
     func codexHome() -> String? {
@@ -198,6 +238,20 @@ struct CodexAuthStore: Sendable {
             return nil
         }
         return codexHome
+    }
+
+    /// Matches Codex's `compute_store_key`: SHA-256 of the canonical home, truncated to 16 hex
+    /// characters. If realpath fails, Codex hashes the original path rather than a partial resolve.
+    /// The CLI's default Keychain home is ~/.codex; the legacy file search order is independent.
+    static func keychainAccount(codexHome: String) -> String {
+        let expanded = expandHome(codexHome)
+        let canonical = expanded.withCString { path -> String in
+            guard let resolved = realpath(path, nil) else { return expanded }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+        let digest = SHA256.hash(data: Data(canonical.utf8))
+        return "cli|" + digest.prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
     static func parseAuth(_ text: String) -> CodexAuth? {
@@ -221,4 +275,3 @@ private extension CodexAuthState.Source {
         return false
     }
 }
-

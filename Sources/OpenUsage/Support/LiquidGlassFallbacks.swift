@@ -10,10 +10,11 @@ import SwiftUI
 /// distinction, the scroll view still scrolls. Nothing here hides a runtime error — each branch is a
 /// compile-time `#available` check, which is the intended way to back-deploy newer-SDK APIs.
 ///
-/// These gate purely on OS version. The popover backdrop is always opaque (`StatusItemController`'s
-/// `NSBox`, matching `Theme.traySurface`), with opaque grouped cards on it; glass is reserved for the
-/// footer chrome — its frosted `.bar` material bar plus the interactive glass controls on it —
-/// rendered in-window over that opaque backing.
+/// These gate purely on OS version. The popover backdrop is opaque by default (`PopoverBackdropView`'s
+/// opaque tray, matching `Theme.traySurface`); the opt-in Increase Transparency mode crossfades it to a
+/// behind-window vibrancy view so the desktop shows through, and the cards swap to a frosted standard
+/// material. Either way glass stays reserved for the footer chrome — its `.bar`/glass bar plus the
+/// interactive glass controls — never the content cards.
 ///
 /// Keeping every `#available(macOS 26, *)` check in this one file means the views (`HeaderView`,
 /// `SettingsScreen`, `DashboardView`) stay free of inline availability branches.
@@ -41,21 +42,16 @@ extension View {
     }
 
     /// A single interactive Liquid Glass surface (in the given shape) drawn behind a *whole control* —
-    /// the footer's split button wraps its `HStack` (Customize + divider + chevron) in one
-    /// `interactiveGlass(in: Capsule())` so the two plain-styled tap targets sit on one continuous
-    /// capsule rather than two separate pills. Apply it to the container, never to each segment, and
-    /// keep the segments `.buttonStyle(.plain)` so this glass is the only surface — the system
-    /// `.buttonStyle(.glass)` renders flat on a `Menu` (its own button chrome wins), and per-segment
+    /// the footer's Options menu button wraps its plain-styled label in one
+    /// `interactiveGlass(in: Capsule())` so it sits on one continuous capsule. Apply it to the
+    /// container, and keep the control `.buttonStyle(.plain)` so this modifier owns the surface — the
+    /// system `.buttonStyle(.glass)` renders flat on a `Menu` (its own button chrome wins), and per-segment
     /// glass would split the capsule. `.interactive()` adds the hover/press shimmer + scale that reads
-    /// as Liquid Glass. macOS 15 gets a frosted material shape with a hairline border (no glass there).
-    @ViewBuilder
-    func interactiveGlass(in shape: some InsettableShape) -> some View {
-        if #available(macOS 26, *) {
-            glassEffect(.regular.interactive(), in: shape)
-        } else {
-            background(.regularMaterial, in: shape)
-                .overlay { shape.strokeBorder(.separator, lineWidth: 0.5) }
-        }
+    /// as Liquid Glass. In the readable translucent modes, `reinforced` adds that same adaptive frosted
+    /// material and hairline under Liquid Glass so a light desktop cannot erase the capsule boundary.
+    /// macOS 15 always gets the frosted material shape with a hairline border (no glass there).
+    func interactiveGlass<Shape: InsettableShape>(in shape: Shape, reinforced: Bool = false) -> some View {
+        modifier(MotionAwareInteractiveGlassModifier(shape: shape, reinforced: reinforced))
     }
 
     /// Liquid Glass surface for a full chrome bar (the footer / top bar) on macOS 26+, a frosted
@@ -119,6 +115,41 @@ extension View {
             scrollEdgeEffectStyle(.soft, for: .bottom)
         } else {
             self
+        }
+    }
+}
+
+private struct MotionAwareInteractiveGlassModifier<Shape: InsettableShape>: ViewModifier {
+    let shape: Shape
+    let reinforced: Bool
+    @Environment(\.reduceAnimations) private var reduceAnimations
+
+    /// Liquid Glass owns its hover/press scale and shimmer outside the view's normal transaction. Swap
+    /// only that interactive variant for static system glass when either Reduce Animations source is on.
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *) {
+            if reinforced {
+                if reduceAnimations {
+                    content
+                        .background(.regularMaterial, in: shape)
+                        .overlay { shape.strokeBorder(.separator, lineWidth: 0.5) }
+                        .glassEffect(.regular, in: shape)
+                } else {
+                    content
+                        .background(.regularMaterial, in: shape)
+                        .overlay { shape.strokeBorder(.separator, lineWidth: 0.5) }
+                        .glassEffect(.regular.interactive(), in: shape)
+                }
+            } else if reduceAnimations {
+                content.glassEffect(.regular, in: shape)
+            } else {
+                content.glassEffect(.regular.interactive(), in: shape)
+            }
+        } else {
+            content
+                .background(.regularMaterial, in: shape)
+                .overlay { shape.strokeBorder(.separator, lineWidth: 0.5) }
         }
     }
 }

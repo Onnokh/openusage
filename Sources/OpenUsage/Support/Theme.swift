@@ -3,12 +3,14 @@ import AppKit
 
 /// Central palette + surface styles. Surfaces stay adaptive (light/dark).
 ///
-/// The popover is always a solid, opaque panel — glass is reserved for the footer chrome (its frosted
-/// bar and the controls on it), never the data region behind it (Apple's guidance: glass for
-/// navigation/controls, content on an opaque surface). The data region mirrors the macOS System
-/// Settings grouped look: a bright page "tray" with borderless grouped cards lifted off it by the
-/// system's own `.fill.quaternary` (the same subtle fill Settings' grouped boxes use — no hand-tuned
-/// values), so it adapts to light/dark like every other Mac app.
+/// By default the popover is a solid, opaque panel; the opt-in Increase Transparency mode (and the
+/// secret-code egg) make it translucent. Either way, Liquid Glass is reserved for the footer/top-bar
+/// chrome — the controls/navigation layer — and never the data cards: Apple's guidance is to keep
+/// Liquid Glass out of the content layer and back content with standard materials instead. The data
+/// region mirrors the macOS System Settings grouped look: a page "tray" with borderless grouped cards
+/// lifted off it by the system's own `.fill.quaternary` (no hand-tuned values), so it adapts to
+/// light/dark like every other Mac app. Under the translucent treatment the cards swap their opaque
+/// base for a frosted standard material so text stays legible (see `cardSurface`).
 enum Theme {
     /// Hierarchical secondary tint for the provider marks.
     static let iconGray = AnyShapeStyle(.secondary)
@@ -68,18 +70,17 @@ extension View {
     /// The grouped-card surface used for provider/settings cards, in the shared rounded shape: the
     /// bright page base lifted by the system's `.fill.quaternary` (the System Settings grouped-box
     /// look), borderless — the subtle fill carries the grouping the way Settings does, in both light
-    /// and dark. Drawing the opaque page base first keeps a lifted drag preview solid while it floats.
-    /// `lifted` is accepted for call-site symmetry; live and lifted cards share one surface (the lift's
-    /// depth comes from `ReorderLiftPreview`'s shadow, not a different fill).
-    func cardSurface(lifted: Bool = false) -> some View {
-        modifier(CardSurfaceModifier(lifted: lifted))
+    /// and dark. Drawing the opaque page base first keeps a lifted drag preview solid while it floats;
+    /// the preview's depth comes from `ReorderLiftPreview`'s shadow, not a different card surface.
+    func cardSurface() -> some View {
+        modifier(CardSurfaceModifier())
     }
 
     /// A single-row lifted preview surface: the card surface plus a thin separator hairline that fences
     /// a free-floating one-row chip off from the rows beneath it (the multi-row provider previews don't
     /// take the hairline — their shadow alone reads as detached).
     func liftedRowSurface() -> some View {
-        cardSurface(lifted: true)
+        cardSurface()
             .overlay { Theme.cardShape.strokeBorder(.separator, lineWidth: 0.5) }
     }
 
@@ -96,15 +97,28 @@ extension View {
 /// system's `.fill.quaternary` composited on top — borderless, matching the macOS System Settings
 /// grouped box in both light and dark. The opaque base means a lifted drag preview stays solid while
 /// it floats; the page base under a live card is the same color as the tray behind it, so it's
-/// invisible there. `lifted` is unused — both paths share the one surface.
+/// invisible there. Live cards and drag previews share the same surface.
+///
+/// Under the translucent surface treatment (Increase Transparency / the secret-code egg) the opaque page base
+/// is dropped so the behind-window vibrancy backdrop shows through, while the system grouped fill stays
+/// so cards still read as grouped boxes over the desktop.
 private struct CardSurfaceModifier: ViewModifier {
-    let lifted: Bool
+    @Environment(\.popoverSurfaceTreatment) private var treatment
 
     func body(content: Content) -> some View {
         content.background {
-            Theme.cardShape
-                .fill(Theme.traySurface)
-                .overlay { Theme.cardShape.fill(Theme.cardFill) }
+            switch treatment {
+            case .opaque:
+                Theme.cardShape
+                    .fill(Theme.traySurface)
+                    .overlay { Theme.cardShape.fill(Theme.cardFill) }
+            case .translucent:
+                // The AppKit backdrop already applies the system blur. A stable translucent surface here
+                // keeps text legible without stacking another live material pass under every card.
+                Theme.cardShape
+                    .fill(Theme.traySurface.opacity(0.55))
+                    .overlay { Theme.cardShape.fill(Theme.cardFill) }
+            }
         }
     }
 }

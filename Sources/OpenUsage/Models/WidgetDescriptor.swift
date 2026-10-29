@@ -1,8 +1,7 @@
 import Foundation
 
-/// What a provider offers to the gallery: identity, render kind, and a sample of the
-/// data it would feed (mocked). The display name is the single `sample.title`, shared
-/// by the tile and the gallery — there is no separate title string.
+/// A provider metric's identity and presentation template. Live provider lines supply the values;
+/// `sample` carries stable display metadata such as title, icon, kind, and descriptor opt-ins.
 struct WidgetDescriptor: Identifiable, Hashable {
     let id: String                 // "claude.session"
     let providerID: String
@@ -11,8 +10,17 @@ struct WidgetDescriptor: Identifiable, Hashable {
     /// Whether this widget can be pinned to the menu-bar strip. False for tiles the tray can't render as
     /// a value — the Usage Trend chart — so the pin affordance never offers a pin that would read "0".
     var pinnable: Bool = true
+    /// True only for the `SpendTileMapper`-backed spend-history tiles (see `WidgetDescriptor.spendTiles`).
+    /// The Total Spend card keys on this to decide which providers feed the ring — a title match would
+    /// wrongly rope in look-alike rows like OpenRouter's API-spend "Today".
+    var isSpendTile: Bool = false
+    /// Stable scalar resources exported by `/v1/limits`. Empty for UI-only/history widgets.
+    var limitResources: [LimitResourceDescriptor] = []
+    /// Explicit aggregation semantics for this provider's normalized daily history. Exactly one
+    /// descriptor carries it for every provider that exposes the shared spend tiles.
+    var historyResource: UsageHistoryDescriptor? = nil
 
-    /// The one display name for this widget (tile + gallery).
+    /// The metric's single display name.
     var title: String { sample.title }
 
     static func == (lhs: WidgetDescriptor, rhs: WidgetDescriptor) -> Bool { lhs.id == rhs.id }

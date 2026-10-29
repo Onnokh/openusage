@@ -14,9 +14,9 @@ import Foundation
 ///
 /// Threading: the capture subprocess never runs (or is waited on) while the state lock is held, so
 /// a cache read can't stall behind it. The **main thread** never triggers the capture — it reads
-/// whatever is cached and otherwise returns `nil`, so opening Settings before the cache warms can't
-/// freeze the UI. Off-main callers (provider refreshes) capture on demand and block only for the
-/// single, one-time spawn, so the first refresh still resolves the key. `prewarm()` kicks the
+/// whatever is cached and otherwise returns `nil`, so opening a provider's API-key editor before the
+/// cache warms can't freeze the UI. Off-main callers (provider refreshes) capture on demand and block
+/// only for the single, one-time spawn, so the first refresh still resolves the key. `prewarm()` kicks the
 /// capture at launch so the cache is normally warm before anything reads it.
 final class LoginShellEnvironment: @unchecked Sendable {
     static let shared = LoginShellEnvironment()
@@ -49,12 +49,36 @@ final class LoginShellEnvironment: @unchecked Sendable {
         return capturedEnvironment()[name]?.nilIfEmpty
     }
 
+    /// The captured value when available, without spawning or waiting for the login shell.
+    func cachedValue(for name: String) -> String? {
+        cachedSnapshot()?[name]?.nilIfEmpty
+    }
+
     /// Spawn the capture eagerly off the main thread so the first provider refresh (and any UI read)
     /// finds the cache already warm and never blocks on the subprocess. Safe to call more than once.
+    /// `.userInitiated`, not `.utility`: launch-time readers depend on this cache, and under
+    /// cold-launch CPU contention a utility-priority spawn regularly lost the race against the first
+    /// provider refresh — which then resolved shell-exported keys as absent for the whole pass.
     func prewarm() {
-        Task.detached(priority: .utility) { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             _ = self?.capturedEnvironment()
         }
+    }
+
+    /// Whether a capture has completed AND yielded a plausible environment. A real login shell always
+    /// exports at least `PATH`/`HOME`, so an empty capture means the spawn or parse failed — callers
+    /// must not persist facts (like "no overrides exported") derived from it.
+    var capturedSuccessfully: Bool {
+        !(cachedSnapshot() ?? [:]).isEmpty
+    }
+
+    /// Off-main only: make sure the one-time capture has actually run (spawning it now if the prewarm
+    /// never completed), then report whether it succeeded. The post-launch snapshot task uses this so
+    /// a launch whose prewarm was slow still persists fresh facts for the next launch.
+    func ensureCaptured() -> Bool {
+        guard !Thread.isMainThread else { return capturedSuccessfully }
+        _ = capturedEnvironment()
+        return capturedSuccessfully
     }
 
     private func cachedSnapshot() -> [String: String]? {
@@ -105,7 +129,7 @@ final class LoginShellEnvironment: @unchecked Sendable {
     /// and end markers and ignoring any shell banner printed outside them.
     static func parse(_ output: String) -> [String: String] {
         let tokens = output.components(separatedBy: "\0")
-        guard let begin = tokens.firstIndex(of: beginMarker) else { return [:] }
+        guard let begin = tokens.firstIndex(where: { $0.hasSuffix(beginMarker) }) else { return [:] }
         let end = tokens.firstIndex(of: endMarker) ?? tokens.count
         guard begin < end else { return [:] }
 

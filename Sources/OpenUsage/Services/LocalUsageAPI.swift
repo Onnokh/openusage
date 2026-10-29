@@ -1,9 +1,11 @@
 import Foundation
 
 /// Routing + JSON for the read-only local usage API, kept pure so it's unit-testable —
-/// `LocalUsageServer` is just the transport. The wire format matches the original app's
-/// docs/local-http-api.md exactly (camelCase `providerId`, `color`, `fetchedAt`, type-tagged
-/// `lines`, `{"error": code}` bodies) so existing third-party consumers keep working unchanged.
+/// `LocalUsageServer` is just the transport. The wire format follows docs/local-http-api.md
+/// (camelCase `providerId`, `color`, `fetchedAt`, type-tagged `lines`, `{"error": code}` bodies).
+/// One deliberate break from the original app, made before multi-account ships: `/v1/usage/:token`
+/// returns an array, and both single-token routes answer by plain string matching (exact card id or
+/// family id) — never by resolving state.
 enum LocalUsageAPI {
     /// Everything one request needs, captured from the MainActor stores into a Sendable value.
     struct State: Sendable {
@@ -11,7 +13,21 @@ enum LocalUsageAPI {
         var enabledOrderedIDs: [String]
         /// Every provider the registry knows — single-provider lookups work for disabled ones too.
         var knownIDs: Set<String>
+        /// The rendered snapshot set shared by both routes. `/v1/usage` and `/v1/limits` only differ
+        /// in how they project this data onto their legacy and normalized wire formats.
         var snapshots: [String: ProviderSnapshot]
+        /// Only descriptors explicitly opted into the stable limits contract.
+        var limitDescriptors: [String: [WidgetDescriptor]] = [:]
+        var errors: [String: String] = [:]
+        var generatedAt = Date()
+
+        /// Every known card the request token names — an exact card id, or a family id naming all of
+        /// that family's cards. Pure string matching, deliberately: the answer never depends on which
+        /// account is logged in, what's enabled, or any other runtime state. Sorted for stable output.
+        /// Empty means the token names nothing (404).
+        func matchingCardIDs(for token: String) -> [String] {
+            knownIDs.filter { $0 == token || ProviderAccountID.family(of: $0) == token }.sorted()
+        }
     }
 
     struct Response: Equatable, Sendable {
@@ -30,6 +46,25 @@ enum LocalUsageAPI {
             .map(String.init)
 
         switch (segments.count, segments.first, segments.dropFirst().first) {
+        case (2, "v1", "limits"):
+            guard method == "GET" else { return error(405, "method_not_allowed") }
+            return Response(
+                status: 200,
+                body: LocalLimitsAPI.encode(providerIDs: state.enabledOrderedIDs, state: state)
+            )
+
+        case (3, "v1", "limits"):
+            guard method == "GET" else { return error(405, "method_not_allowed") }
+            // The token names cards by plain string matching (see `matchingCardIDs`). The envelope is
+            // already keyed by card id, so one card and a whole family serialize identically; a
+            // matched card with no data yet simply has no entry. Only a token naming nothing is 404.
+            let providerIDs = state.matchingCardIDs(for: segments[2])
+            guard !providerIDs.isEmpty else { return error(404, "provider_not_found") }
+            return Response(
+                status: 200,
+                body: LocalLimitsAPI.encode(providerIDs: providerIDs, state: state)
+            )
+
         case (2, "v1", "usage"):
             guard method == "GET" else { return error(405, "method_not_allowed") }
             let snapshots = state.enabledOrderedIDs.compactMap { state.snapshots[$0] }
@@ -37,10 +72,14 @@ enum LocalUsageAPI {
 
         case (3, "v1", "usage"):
             guard method == "GET" else { return error(405, "method_not_allowed") }
-            let providerID = segments[2]
-            guard state.knownIDs.contains(providerID) else { return error(404, "provider_not_found") }
-            guard let snapshot = state.snapshots[providerID] else { return Response(status: 204, body: nil) }
-            return Response(status: 200, body: encode(WireSnapshot(snapshot)))
+            // Same matching as `/v1/limits/:token`, same always-an-array shape as the collection
+            // route: every matched card with a snapshot, `[]` when the matches have no data yet.
+            // (Breaking change from the original single-object shape, made before multi-account
+            // ships so the shape never has to fork on how many cards a token names.)
+            let providerIDs = state.matchingCardIDs(for: segments[2])
+            guard !providerIDs.isEmpty else { return error(404, "provider_not_found") }
+            let snapshots = providerIDs.compactMap { state.snapshots[$0] }
+            return Response(status: 200, body: encode(snapshots.map(WireSnapshot.init)))
 
         default:
             return error(404, "not_found")
@@ -96,10 +135,12 @@ enum LocalUsageAPI {
                 try container.encode(value, forKey: .value)
                 try container.encode(color, forKey: .color)        // explicit null, like the original
                 try container.encode(subtitle, forKey: .subtitle)
-            case .values(let label, let values, let color, let expiriesAt):
+            case .values(let label, let values, let color, let expiriesAt, _, _):
                 // Serialize as the original `text` shape (one combined `value` string) so existing
                 // local-API integrations keep working: dollars in full, counts compact — exactly the
                 // string the mapper used to produce (e.g. "$5.17 · 9.2M tokens").
+                // Per-model hover details are UI-only for now and are intentionally omitted from this
+                // documented public wire shape.
                 try container.encode("text", forKey: .type)
                 try container.encode(label, forKey: .label)
                 try container.encode(Self.legacyValueString(values), forKey: .value)

@@ -19,6 +19,8 @@ struct WidgetRegistry: Sendable {
     /// (a stable `filter` walk), so `descriptors(for:)` returns the exact sequence the UI metric order
     /// depends on.
     private let descriptorsByProvider: [String: [WidgetDescriptor]]
+    let limitDescriptorsByProvider: [String: [WidgetDescriptor]]
+    let historyDescriptorsByProvider: [String: UsageHistoryDescriptor]
 
     init(providers: [Provider], descriptors: [WidgetDescriptor]) {
         self.providers = providers
@@ -36,12 +38,28 @@ struct WidgetRegistry: Sendable {
             byProvider[descriptor.providerID, default: []].append(descriptor)
         }
         self.descriptorsByProvider = byProvider
+        self.limitDescriptorsByProvider = byProvider.mapValues {
+            $0.filter { !$0.limitResources.isEmpty }
+        }
+        self.historyDescriptorsByProvider = byProvider.compactMapValues { descriptors in
+            descriptors.compactMap(\.historyResource).first
+        }
     }
 
     func descriptor(id: String) -> WidgetDescriptor? { descriptorsByID[id] }
     func provider(id: String) -> Provider? { providersByID[id] }
     func descriptors(for providerID: String) -> [WidgetDescriptor] {
         descriptorsByProvider[providerID] ?? []
+    }
+
+    /// Saved order filtered to installed providers, with newly introduced providers appended in the
+    /// canonical registry order. Shared by the dashboard, local API, and one-shot CLI.
+    func orderedProviderIDs(savedOrder: [String]) -> [String] {
+        let defaults = providers.map(\.id)
+        let known = Set(defaults)
+        let saved = savedOrder.filter { known.contains($0) }
+        let savedIDs = Set(saved)
+        return saved + defaults.filter { !savedIDs.contains($0) }
     }
 
     @MainActor

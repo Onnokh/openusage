@@ -2,17 +2,7 @@ import Foundation
 
 /// A GitHub token already on the machine, usable against the Copilot usage endpoint.
 struct CopilotToken: Hashable, Sendable {
-    enum Source: Hashable, Sendable {
-        /// The OAuth token written by the Copilot editor plugins (VS Code / JetBrains / Neovim).
-        case editorApp
-        /// `oauth_token` stored in the GitHub CLI's `hosts.yml` (file-based storage).
-        case ghConfig
-        /// The GitHub CLI token stored in the macOS Keychain via go-keyring.
-        case ghKeychain
-    }
-
     var value: String
-    var source: Source
 }
 
 enum CopilotAuthError: Error, LocalizedError, Equatable {
@@ -68,7 +58,7 @@ struct CopilotAuthStore: Sendable {
             else {
                 continue
             }
-            return CopilotToken(value: token, source: .editorApp)
+            return CopilotToken(value: token)
         }
         return nil
     }
@@ -80,16 +70,16 @@ struct CopilotAuthStore: Sendable {
         else {
             return nil
         }
-        return CopilotToken(value: token, source: .ghConfig)
+        return CopilotToken(value: token)
     }
 
     func loadFromGhKeychain() -> CopilotToken? {
         guard let raw = readGhKeychainRaw(),
-              let token = Self.unwrapGoKeyring(raw)
+              let token = ProviderParse.unwrapGoKeyring(raw)
         else {
             return nil
         }
-        return CopilotToken(value: token, source: .ghKeychain)
+        return CopilotToken(value: token)
     }
 
     private func readGhKeychainRaw() -> String? {
@@ -167,20 +157,4 @@ struct CopilotAuthStore: Sendable {
         return nil
     }
 
-    /// Unwrap a `go-keyring-base64:`-prefixed value (how `gh` stores its token in the macOS Keychain),
-    /// returning the decoded token. A value without the prefix is returned trimmed as-is.
-    static func unwrapGoKeyring(_ raw: String) -> String? {
-        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prefix = "go-keyring-base64:"
-        if text.hasPrefix(prefix) {
-            let encoded = String(text.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let data = Data(base64Encoded: encoded),
-                  let decoded = String(data: data, encoding: .utf8)
-            else {
-                return nil
-            }
-            text = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return text.nilIfEmpty
-    }
 }
