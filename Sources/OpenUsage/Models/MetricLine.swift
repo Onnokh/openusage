@@ -84,13 +84,25 @@ enum MetricLine: Hashable, Sendable, Codable {
     /// An unbounded row carrying one or more raw numbers (see `MetricValue`) — the preferred shape for
     /// numeric rows. The number is the source of truth; formatting and which value(s) to show happen at
     /// the display edge, so the menu bar never has to re-parse a finished string. `.text` stays only for
-    /// genuinely string-y rows and a few descriptor-bounded dollar rows.
+    /// genuinely string-valued provider notices exposed through the local API; widgets do not parse it.
     ///
     /// `expiriesAt` carries zero or more future expiry instants the row surfaces in its hover tooltip —
     /// used for the Codex rate-limit-reset-credits row ("2 available", with each credit's expiry listed
     /// on hover). Carried as raw `Date`s (not baked strings) so they count down on the popover's clock
     /// tick and honor the global relative/absolute reset mode, like a bounded row's reset countdown.
-    case values(label: String, values: [MetricValue], colorHex: String? = nil, expiriesAt: [Date] = [])
+    ///
+    /// `unknownModels` carries the names of models this period's spend used that the pricing sources
+    /// don't know. The row keeps a warning triangle listing them on hover, including when their
+    /// usage is estimated with a fallback. `modelBreakdown` carries the period-scoped ranked model
+    /// list for spend rows; it is internal UI data, not part of the local HTTP API wire shape.
+    case values(
+        label: String,
+        values: [MetricValue],
+        colorHex: String? = nil,
+        expiriesAt: [Date] = [],
+        unknownModels: [String] = [],
+        modelBreakdown: ModelUsageBreakdown? = nil
+    )
     case progress(
         label: String,
         used: Double,
@@ -106,7 +118,7 @@ enum MetricLine: Hashable, Sendable, Codable {
         switch self {
         case .text(let label, _, _, _),
              .progress(let label, _, _, _, _, _, _),
-             .values(let label, _, _, _),
+             .values(let label, _, _, _, _, _),
              .badge(let label, _, _, _),
              .chart(let label, _, _):
             return label
@@ -146,6 +158,8 @@ enum MetricLine: Hashable, Sendable, Codable {
         case format
         case resetsAt
         case expiriesAt
+        case unknownModels
+        case modelBreakdown
         case periodDurationMs
         case colorHex
         case subtitle
@@ -178,7 +192,9 @@ enum MetricLine: Hashable, Sendable, Codable {
                 label: label,
                 values: try container.decode([MetricValue].self, forKey: .values),
                 colorHex: try container.decodeIfPresent(String.self, forKey: .colorHex),
-                expiriesAt: try container.decodeIfPresent([Date].self, forKey: .expiriesAt) ?? []
+                expiriesAt: try container.decodeIfPresent([Date].self, forKey: .expiriesAt) ?? [],
+                unknownModels: try container.decodeIfPresent([String].self, forKey: .unknownModels) ?? [],
+                modelBreakdown: try container.decodeIfPresent(ModelUsageBreakdown.self, forKey: .modelBreakdown)
             )
         case .progress:
             self = .progress(
@@ -215,12 +231,14 @@ enum MetricLine: Hashable, Sendable, Codable {
             try container.encode(value, forKey: .value)
             try container.encodeIfPresent(colorHex, forKey: .colorHex)
             try container.encodeIfPresent(subtitle, forKey: .subtitle)
-        case .values(let label, let values, let colorHex, let expiriesAt):
+        case .values(let label, let values, let colorHex, let expiriesAt, let unknownModels, let modelBreakdown):
             try container.encode(LineType.values, forKey: .type)
             try container.encode(label, forKey: .label)
             try container.encode(values, forKey: .values)
             try container.encodeIfPresent(colorHex, forKey: .colorHex)
             if !expiriesAt.isEmpty { try container.encode(expiriesAt, forKey: .expiriesAt) }
+            if !unknownModels.isEmpty { try container.encode(unknownModels, forKey: .unknownModels) }
+            try container.encodeIfPresent(modelBreakdown, forKey: .modelBreakdown)
         case .progress(let label, let used, let limit, let format, let resetsAt, let periodDurationMs, let colorHex):
             try container.encode(LineType.progress, forKey: .type)
             try container.encode(label, forKey: .label)
@@ -244,4 +262,3 @@ enum MetricLine: Hashable, Sendable, Codable {
         }
     }
 }
-

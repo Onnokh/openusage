@@ -1,7 +1,7 @@
 import Foundation
 
 extension Bundle {
-    /// The bundle carrying OpenUsage's copied resources (provider SVGs, Cursor model manifest).
+    /// The bundle carrying OpenUsage's copied resources (provider SVGs, pricing supplement + snapshots).
     ///
     /// SwiftPM generates `Bundle.module` for an executable target that only looks two places: next to
     /// `Bundle.main.bundleURL` (which, for a packaged `.app`, is the app root) and a path into the build
@@ -14,9 +14,13 @@ extension Bundle {
     /// `Bundle.module` for `swift run` / `swift test`, where the build path is valid.
     static let openUsageResources: Bundle = {
         let bundleName = "OpenUsage_OpenUsage.bundle"
+        let containingAppResources = Bundle.main.executableURL
+            .flatMap(ContainingAppBundle.url(for:))?
+            .appendingPathComponent("Contents/Resources", isDirectory: true)
         let searchBases: [URL?] = [
             Bundle.main.resourceURL,                          // packaged .app: Contents/Resources
             Bundle.main.bundleURL,                            // bundle beside the app root
+            containingAppResources,                          // bundled CLI: helper -> app Resources
             Bundle(for: ResourceBundleToken.self).resourceURL,
             Bundle(for: ResourceBundleToken.self).bundleURL
         ]
@@ -35,11 +39,11 @@ extension Bundle {
     }()
 }
 
-/// Sentinel check: a valid OpenUsage resource bundle carries the bundled Cursor model manifest at its
-/// root (`.copy("Resources/model_manifest.json")`). Uses the same lookup the manifest loader relies on,
-/// so it can never reject the real shipped bundle.
+/// Sentinel check: a valid OpenUsage resource bundle carries the bundled pricing supplement at its
+/// root (`.copy("Resources/pricing_supplement.json")`). Uses the same lookup the pricing store relies
+/// on, so it can never reject the real shipped bundle.
 private func isValidOpenUsageResourceBundle(_ bundle: Bundle) -> Bool {
-    bundle.url(forResource: "model_manifest", withExtension: "json") != nil
+    bundle.url(forResource: "pricing_supplement", withExtension: "json") != nil
 }
 
 private final class ResourceBundleToken {}

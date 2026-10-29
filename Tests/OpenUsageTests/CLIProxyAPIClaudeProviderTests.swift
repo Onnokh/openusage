@@ -53,6 +53,20 @@ final class CLIProxyAPIAuthStoreTests: XCTestCase {
         XCTAssertNotEqual(accounts[0].providerID, accounts[1].providerID)
     }
 
+    @MainActor
+    func testSkipsAccountsThatAlreadyHaveAClaudeCard() {
+        let both = #"{"type":"claude","email":"amy@x.nl","account_uuid":"U-AMY","organization_uuid":"O-1","access_token":"a"}"#
+        let proxyOnly = #"{"type":"claude","email":"zed@x.nl","account_uuid":"u-zed","organization_uuid":"o-2","access_token":"a"}"#
+        let s = store([
+            "\(Self.authDir)/claude-1-amy@x.nl.json": both,
+            "\(Self.authDir)/claude-2-zed@x.nl.json": proxyOnly
+        ], config: "auth-dir: \(Self.authDir)\n")
+
+        let providers = CLIProxyAPIClaudeProvider.discover(authStore: s, skipping: ["u-amy|o-1"])
+
+        XCTAssertEqual(providers.map(\.account.email), ["zed@x.nl"])
+    }
+
     func testAccessTokenRejectsExpiredAndDisabledAccountsWithoutRefreshing() {
         let path = "\(Self.authDir)/claude-1-a@x.nl.json"
         let ref = CLIProxyAPIClaudeAccountRef(path: path, email: "a@x.nl", accountUUID: "u")
@@ -74,7 +88,7 @@ final class CLIProxyAPIAuthStoreTests: XCTestCase {
 final class CLIProxyAPIClaudeProviderTests: XCTestCase {
     private let path = "/proxy/auth/claude-1-onno@x.nl.json"
     private static let usageBody = #"{"five_hour":{"utilization":42,"resets_at":"2100-01-01T00:00:00Z"},"seven_day":{"utilization":10}}"#
-    private static let maxProfileBody = #"{"account":{"has_claude_max":true},"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}}"#
+    private static let maxProfileBody = #"{"account":{"uuid":"u"},"organization":{"uuid":"o","organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}}"#
 
     /// `responses` maps a request path ("/api/oauth/usage") to its status and body.
     private func makeProvider(_ responses: [String: (Int, String)]) -> (CLIProxyAPIClaudeProvider, RoutingHTTPClient) {
@@ -135,17 +149,6 @@ final class CLIProxyAPIClaudeProviderTests: XCTestCase {
         XCTAssertNil(first.plan)
         XCTAssertNotNil(first.line(label: "Session"))
         XCTAssertEqual(http.requests.filter { $0.url.path == "/api/oauth/profile" }.count, 2)
-    }
-
-    func testMapsProfileOrganizationToThePlanLabel() {
-        func plan(_ type: String, _ tier: String?) -> String? {
-            let tierJSON = tier.map { #","rate_limit_tier":"\#($0)""# } ?? ""
-            return CLIProxyAPIClaudeProvider.plan(fromProfile: Data(#"{"organization":{"organization_type":"\#(type)"\#(tierJSON)}}"#.utf8))
-        }
-        XCTAssertEqual(plan("claude_max", "default_claude_max_5x"), "Max 5x")
-        XCTAssertEqual(plan("claude_pro", "default_claude_ai"), "Pro")
-        XCTAssertEqual(plan("claude_team", "default_claude_max_5x"), "Team 5x")
-        XCTAssertNil(CLIProxyAPIClaudeProvider.plan(fromProfile: Data("{}".utf8)))
     }
 
     func testRejectedTokenPointsAtCLIProxyAPIInsteadOfRefreshing() async {

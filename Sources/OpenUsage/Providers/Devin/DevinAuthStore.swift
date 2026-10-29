@@ -1,14 +1,8 @@
 import Foundation
 
 struct DevinAuth: Hashable, Sendable {
-    enum Source: Hashable, Sendable {
-        case credentialsFile
-        case appState
-    }
-
     var apiKey: String
     var apiServerUrl: String?
-    var source: Source
 }
 
 enum DevinAuthError: Error, LocalizedError, Equatable {
@@ -48,8 +42,7 @@ struct DevinAuthStore: Sendable {
 
         return DevinAuth(
             apiKey: apiKey,
-            apiServerUrl: Self.cleanAPIServerURL(Self.readTomlString(text, key: "api_server_url")),
-            source: .credentialsFile
+            apiServerUrl: Self.cleanAPIServerURL(Self.readTomlString(text, key: "api_server_url"))
         )
     }
 
@@ -64,7 +57,7 @@ struct DevinAuthStore: Sendable {
             return nil
         }
 
-        return DevinAuth(apiKey: apiKey, apiServerUrl: nil, source: .appState)
+        return DevinAuth(apiKey: apiKey, apiServerUrl: nil)
     }
 
     func effectiveAPIServerURL(_ auth: DevinAuth) -> String {

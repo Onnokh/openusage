@@ -1,52 +1,83 @@
-# OpenCode Go
+# OpenCode
 
-> Tracks observed OpenCode Go spend from local OpenCode history on this machine.
-
-## Overview
-
-- **Provider id:** `opencode-go`
-- **Source of truth:** `~/.local/share/opencode/opencode.db` (OpenCode's local SQLite history)
-- **Detection signal:** `~/.local/share/opencode/auth.json`
-- **Usage scope:** local observed assistant spend only — no remote or other-device usage
-
-OpenCode publishes no usage API, so OpenUsage reads spend straight from OpenCode's own local database
-and shows it against the published OpenCode Go plan limits.
-
-## When it shows up
-
-The provider stays hidden until there's a sign OpenCode Go is in use, then it appears. Either is enough:
-
-- `auth.json` has an `opencode-go` entry with a non-empty `key`, or
-- the local history already contains `opencode-go` assistant messages with a numeric cost.
-
-If neither is present, the provider stays hidden.
+Tracks your OpenCode-hosted usage — the **Go** subscription and the **Zen** pay-as-you-go gateway. Go
+plan windows come from OpenCode's official usage API. Spend tiles and the usage trend still come from
+OpenCode's logs already on your Mac.
 
 ## What it tracks
 
-Three meters, each showing local spend as a percentage of the fixed plan limit (clamped at 100%):
+| Metric | Meaning |
+|---|---|
+| Session | Go usage in the rolling 5-hour window, as a percent, with the reset countdown |
+| Weekly | Go usage this week, as a percent (resets Monday UTC) |
+| Monthly | Go usage this billing cycle, as a percent |
+| Today / Yesterday / Last 30 Days | Local cost and tokens across all your OpenCode-hosted usage (Go + Zen) |
+| Usage Trend | A day-by-day sparkline of tokens over the last month |
 
-| Meter   | Window                                            | Limit |
-| ------- | ------------------------------------------------- | ----- |
-| Session | rolling last 5 hours                              | $12   |
-| Weekly  | UTC Monday 00:00 → next UTC Monday 00:00          | $30   |
-| Monthly | subscription-style month anchored to first usage  | $60   |
+When you have the Go subscription, OpenUsage shows "Go" beside the provider name.
 
-Session and Weekly are shown above the fold; Monthly sits behind the "Shown on expand" caret. Only
-assistant messages with a numeric cost count toward the totals.
+The Session / Weekly / Monthly meters are **account-wide** — the same percents the OpenCode dashboard
+shows, including usage from other machines. If you only use the Zen pay-as-you-go gateway (no Go
+subscription), the cap meters are hidden and you'll just see the spend tiles.
 
-The monthly window is inferred from local history, not read from an account API: it uses the earliest
-observed local OpenCode Go usage timestamp as the monthly anchor. Before any usage is recorded, it falls
-back to UTC calendar-month boundaries.
+## Where credentials come from
 
-## Errors
+Use OpenCode as usual. OpenUsage reads the `opencode-go` API key from OpenCode's local data directory
+(`~/.local/share/opencode`, or `$OPENCODE_DATA_DIR` / `$XDG_DATA_HOME` if you've set them) and sends it
+as a Bearer token to the usage API. OpenCode 2 keeps that key in its local databases; OpenCode 1 keeps
+it in `auth.json`. Once OpenCode 2 has moved your logins into its databases, OpenUsage ignores that
+file. OpenCode 1 keeps using `auth.json`, even though recent 1.x versions already create the empty
+database table. Logging out of Go in OpenCode 2 is respected. There's no login prompt and no token
+to paste. Spend tiles still read the local SQLite logs in that same directory.
 
-- **Not detected** — neither auth nor local history indicates OpenCode Go is in use. The provider is
-  hidden until you log in with OpenCode Go or use it locally.
-- **No usage data** — auth or prior history shows OpenCode Go is in use, but the local database is
-  currently missing or unreadable. The provider stays visible with a grey status badge rather than
-  failing hard.
+When OpenCode uses its built-in ChatGPT Pro/Plus OAuth login, that usage belongs to the Codex
+subscription and appears in OpenUsage's **Codex** spend tiles and trend, including OpenCode 2's
+local logs. It is not mixed into the OpenCode-hosted Go + Zen totals. Its separate per-request token
+buckets are estimated with the same cache, long-context, and fast/priority rules as native Codex
+usage. Each release channel (stable `opencode.db`, preview `opencode-next.db`) is judged by its own
+login, so one channel on an API key never hides another channel's ChatGPT usage. Ordinary OpenAI
+API-key traffic is not attributed to Codex.
 
-## Future compatibility
+## The meters and spend tiles
 
-The provider id stays `opencode-go`. If OpenCode later exposes account-truth usage by API key, the
-backend can be swapped without changing the provider id or the meters shown.
+Go meters are percents from `GET https://opencode.ai/zen/go/v1/usage` — OpenCode's own accounting, not
+an estimate. Each spend tile shows cost and tokens together (`$4.08 · 1.2M tokens`), the same as Claude /
+Codex / Cursor. Those dollars come straight from the per-message cost OpenCode records for its hosted
+gateways on this Mac, so they can be lower than account-wide Go usage. A period with no recorded local
+usage reads "No data" rather than a misleading `$0.00`. No log data leaves your Mac.
+
+While the rolling 5-hour session window has no usage in it, the Session row shows **Not started** on
+the trailing label; hover explains that the session begins after your first message. Once the window is
+running the row shows the countdown to its reset — including when OpenCode's whole-percent numbers
+still read 0% because less than 1% has been used.
+
+## Troubleshooting
+
+- **No Session / Weekly / Monthly meters** — those are Go-plan windows. You'll see them when you're
+  logged into OpenCode Go and the key has an active subscription.
+  Zen-only users see the spend tiles instead.
+- **"OpenCode Go key was rejected"** — the local key was not accepted. Log into OpenCode Go again. If
+  you have local usage, the spend tiles still show; only the Go meters are hidden. The same applies
+  when the usage API can't be reached.
+- **"No OpenCode Go subscription on this key"** — the key is valid but this account isn't on Go. The
+  spend tiles still work if you use Zen locally.
+- **"Couldn't read OpenCode's auth.json"** — the file exists but is unreadable or not valid JSON. Check
+  its permissions, or log into OpenCode Go again to rewrite it.
+- **Spend tiles show "No data"** — OpenUsage needs OpenCode's local database at
+  `~/.local/share/opencode/opencode*.db`. Run an OpenCode session, then refresh.
+- **"Couldn't read OpenCode's local database"** — the database (or data directory) exists but couldn't be
+  read this refresh. If you're on Go, the percent meters still refresh; quit OpenCode and refresh to
+  restore the tiles. If it persists, check the permissions on `~/.local/share/opencode`.
+
+## Under the hood
+
+Go windows: `GET https://opencode.ai/zen/go/v1/usage` with the `opencode-go` key as `Authorization:
+Bearer …`. The response is `{ usage: { rolling, weekly, monthly } }`, each with `percent` and
+`resetsAt`. A 401 is a rejected key; a 403 `EntitlementError` means no Go subscription.
+
+Spend tiles and trend: assistant-message `cost` and token fields from every `opencode*.db` in the data
+directory (OpenCode partitions its database by release channel — stable is `opencode.db`, the preview
+line is `opencode-next.db` — so all channels are unioned). Both `opencode-go` (Go) and `opencode` (Zen)
+count. OpenCode 1 logs to the `message` table and OpenCode 2 to `session_message`; both are read, and
+completed context compactions count too. OpenCode 2 copies old messages into the new table under the
+same ID, so each message is counted once. Read-only.

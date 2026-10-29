@@ -11,7 +11,6 @@ final class ProviderLinksTests: XCTestCase {
 
     func testNoLinksYieldsEmptyVisibleLinks() {
         XCTAssertTrue(provider([]).visibleLinks.isEmpty)
-        XCTAssertTrue(provider([.init(label: "", url: "")]).visibleLinks.isEmpty)
     }
 
     func testKeepsValidHttpsAndHttp() {
@@ -19,36 +18,26 @@ final class ProviderLinksTests: XCTestCase {
             ProviderLink(label: "Status", url: "https://status.example.com/"),
             ProviderLink(label: "HTTP", url: "http://example.com/dashboard")
         ]
-        let visible = provider(links).visibleLinks
-        XCTAssertEqual(visible.count, 2)
-        XCTAssertEqual(visible[0].label, "Status")
-        XCTAssertEqual(visible[0].url, "https://status.example.com/")
-        XCTAssertEqual(visible[1].url, "http://example.com/dashboard")
+        XCTAssertEqual(provider(links).visibleLinks, links)
     }
 
-    func testDropsEmptyLabelOrUrl() {
-        let links = [
+    func testRejectsEmptyOrWhitespaceOnlyFields() {
+        let invalidLinks = [
             ProviderLink(label: "", url: "https://example.com/"),
             ProviderLink(label: "No URL", url: ""),
-            ProviderLink(label: "Both", url: "https://example.com/")
-        ]
-        XCTAssertEqual(provider(links).visibleLinks.map(\.label), ["Both"])
-    }
-
-    func testDropsWhitespaceOnlyLabelOrUrl() {
-        let links = [
             ProviderLink(label: "   ", url: "https://example.com/"),
-            ProviderLink(label: "Spaces", url: "   "),
-            ProviderLink(label: "Kept", url: "https://example.com/")
+            ProviderLink(label: "Spaces", url: "   ")
         ]
-        XCTAssertEqual(provider(links).visibleLinks.map(\.label), ["Kept"])
+        for link in invalidLinks {
+            XCTAssertTrue(provider([link]).visibleLinks.isEmpty, "\(link)")
+        }
     }
 
     func testTrimsLabelAndUrl() {
-        let visible = provider([.init(label: "  Status  ", url: "  https://status.example.com/  ")]).visibleLinks
-        XCTAssertEqual(visible.count, 1)
-        XCTAssertEqual(visible[0].label, "Status")
-        XCTAssertEqual(visible[0].url, "https://status.example.com/")
+        XCTAssertEqual(
+            provider([.init(label: "  Status  ", url: "  https://status.example.com/  ")]).visibleLinks,
+            [ProviderLink(label: "Status", url: "https://status.example.com/")]
+        )
     }
 
     func testRejectsNonHttpSchemes() {
@@ -70,5 +59,28 @@ final class ProviderLinksTests: XCTestCase {
             ProviderLink(label: "Console", url: "https://console.anthropic.com/")
         ]
         XCTAssertEqual(provider(links).visibleLinks.map(\.label), ["Status", "Console"])
+    }
+
+    /// Every installed provider ships at most two quick links with standard labels.
+    @MainActor
+    func testInstalledProvidersRespectQuickLinkCap() {
+        let allowed = Set(["Status", "Dashboard", "API Keys", "Usage", "Activity", "Credits"])
+        let suiteName = "ProviderLinksTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let providers = ProviderCatalog.make(defaults: defaults)
+        for runtime in providers {
+            let links = runtime.provider.visibleLinks
+            XCTAssertLessThanOrEqual(
+                links.count, 2,
+                "\(runtime.provider.displayName) has \(links.count) quick links"
+            )
+            for link in links {
+                XCTAssertTrue(
+                    allowed.contains(link.label),
+                    "\(runtime.provider.displayName) link label '\(link.label)' is non-standard"
+                )
+            }
+        }
     }
 }

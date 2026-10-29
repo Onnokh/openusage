@@ -14,6 +14,8 @@ enum ErrorCategory: String, Sendable, CaseIterable, Codable {
     case authExpired = "auth_expired"
     /// Auth is structurally wrong rather than stale (bad payload, misconfigured OAuth URL, unsupported key).
     case authInvalid = "auth_invalid"
+    /// Local credential material exists, but its file, database, or Keychain entry could not be read.
+    case credentialAccess = "credential_access"
     /// The request never completed (transport / connection failure).
     case network = "network"
     /// A response came back but could not be parsed / a required field was missing.
@@ -53,8 +55,10 @@ extension ClaudeAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .notLoggedIn: .notLoggedIn
-        case .sessionExpired, .tokenExpired: .authExpired
-        case .invalidOAuthURL: .authInvalid
+        case .sessionExpired, .tokenExpired, .desktopTokenExpired, .swapTokenExpired: .authExpired
+        case .invalidOAuthURL, .desktopCredentialsUnavailable: .authInvalid
+        case .desktopPermissionRequired: .credentialAccess
+        case .credentialsChanged: .other
         }
     }
 }
@@ -121,14 +125,6 @@ extension CursorUsageError: CategorizedError {
     }
 }
 
-extension OpenCodeAuthError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .notDetected: .notLoggedIn
-        }
-    }
-}
-
 extension GrokAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
@@ -186,6 +182,40 @@ extension CopilotUsageError: CategorizedError {
     }
 }
 
+extension OllamaAuthError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .missingKey, .notSignedIn: .notLoggedIn
+        case .keyUnreadable: .credentialAccess
+        case .invalidKey: .authInvalid
+        }
+    }
+}
+
+extension OllamaUsageError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .connectionFailed: .network
+        case .invalidResponse: .decoding
+        case .requestFailed(let status): ErrorCategory.http(status)
+        }
+    }
+}
+
+extension OpenCodeUsageError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .notLoggedIn: .notLoggedIn
+        case .credentialsUnreadable, .databaseUnreadable: .credentialAccess
+        case .unauthorized: .authExpired
+        case .noGoSubscription: .notAvailable
+        case .connectionFailed: .network
+        case .invalidResponse: .decoding
+        case .requestFailed(let status): ErrorCategory.http(status)
+        }
+    }
+}
+
 extension OpenRouterAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
@@ -206,6 +236,27 @@ extension OpenRouterUsageError: CategorizedError {
     }
 }
 
+extension ZAIAuthError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .missingKey: .notLoggedIn
+        case .invalidKey: .authInvalid
+        case .saveFailed, .deleteFailed: .other
+        }
+    }
+}
+
+extension ZAIUsageError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .connectionFailed: .network
+        case .invalidResponse: .decoding
+        case .requestFailed(let status): ErrorCategory.http(status)
+        case .noCodingPlan: .notAvailable
+        }
+    }
+}
+
 extension HTTPClientError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
@@ -218,6 +269,8 @@ extension AntigravityError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .notSignedIn: .notLoggedIn
+        case .credentialStoreUnreadable: .credentialAccess
+        case .invalidCredentialData: .authInvalid
         case .authExpired: .authExpired
         case .unavailable: .network
         }

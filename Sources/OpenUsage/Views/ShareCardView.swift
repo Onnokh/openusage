@@ -16,7 +16,7 @@ struct ShareCardView: View {
     var plan: String?
     let rows: [WidgetData]
     let appearance: ColorScheme
-    /// Index in `rows` where the "shown on expand" rows begin (the always-shown count), so the
+    /// Index in `rows` where the On Demand rows begin (the Always Visible count), so the
     /// neighbor-aware condensing treats the expand caret as a hard boundary the way the live dashboard
     /// does. `nil` when the provider is collapsed (no expanded section).
     var expandBoundaryIndex: Int? = nil
@@ -26,15 +26,10 @@ struct ShareCardView: View {
     static let width: CGFloat = 360
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        ShareCardChrome(appearance: appearance) {
             headerRow
             metricsCard
-            footer
         }
-        .padding(16)
-        .frame(width: Self.width, alignment: .topLeading)
-        .background(Theme.traySurface)
-        .environment(\.colorScheme, appearance)
     }
 
     // MARK: - Header
@@ -42,7 +37,7 @@ struct ShareCardView: View {
     /// Provider mark + name (+ optional plan), leading — logo, then name, then plan — at the popover's
     /// type scale so it sits in proportion to the rows. Static: no drag grip, spinner, staleness tag, or
     /// warning triangle.
-    private var headerRow: some View {
+    var headerRow: some View {
         HStack(spacing: 10) {
             ProviderIcon(source: provider.icon, inset: 0.04)
                 .frame(width: 22, height: 22)
@@ -56,6 +51,7 @@ struct ShareCardView: View {
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .layoutPriority(1)
                 }
             }
             Spacer(minLength: 0)
@@ -88,35 +84,19 @@ struct ShareCardView: View {
         }
     }
 
-    /// Indices of text-only rows that sit directly under another text-only row — the neighbor-aware
-    /// condensing rule the live dashboard applies, so a run of one-liners (Today / Yesterday /
-    /// Last 30 Days) pulls into one cluster in the export the same way it does in the popover. The
-    /// expand caret is a hard boundary: condensing runs within the always-shown rows and within the
-    /// expanded rows separately, never across, so the export's spacing matches the popover.
+    /// Flat indices of text-only rows that condense under another text-only row — the neighbor-aware rule
+    /// the live dashboard applies (shared via `WidgetData.condensedTextRowOffsets`), so a run of one-liners
+    /// (Today / Yesterday / Last 30 Days) clusters in the export the same way it does in the popover. The
+    /// expand caret is a hard boundary: each segment (always-shown, then expanded) is scanned separately,
+    /// never across, and its segment-local offsets are mapped back to flat `rows` indices.
     static func condensedTextRowIndices(_ rows: [WidgetData], boundary: Int? = nil) -> Set<Int> {
+        let edges = boundary.map { [0, $0, rows.count] } ?? [0, rows.count]
         var indices = Set<Int>()
-        let end = rows.count
-        let edges = boundary.map { [0, $0, end] } ?? [0, end]
         for (lower, upper) in zip(edges, edges.dropFirst()) {
-            for i in (lower + 1)..<upper where !rows[i - 1].isBounded && !rows[i].isBounded {
-                indices.insert(i)
-            }
+            let offsets = WidgetData.condensedTextRowOffsets(in: Array(rows[lower..<upper]))
+            indices.formUnion(offsets.map { lower + $0 })
         }
         return indices
     }
 
-    // MARK: - Footer
-
-    /// The brand mark + tagline, centered at the bottom of the card. Quiet (secondary) so it reads as
-    /// a watermark, not a headline.
-    private var footer: some View {
-        HStack(spacing: 6) {
-            ProviderIcon(source: .providerMark("openusage"), inset: 0)
-                .frame(width: 14, height: 14)
-            Text("Monitor Your AI Subscriptions with OpenUsage")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-    }
 }

@@ -2,39 +2,27 @@ import XCTest
 @testable import OpenUsage
 
 final class DevinAuthStoreTests: XCTestCase {
-    func testParsesCredentialsTomlAndCleansServerURL() {
-        let store = DevinAuthStore(
-            files: FakeFiles([
-                DevinAuthStore.credentialsPath: """
-                windsurf_api_key = "devin-session-token$cli"
-                api_server_url = "https://server.codeium.test/"
-                """
-            ]),
-            sqlite: FakeSQLite()
-        )
+    func testParsesCredentialsTomlAndAcceptsOnlyHTTPSServerURL() {
+        func load(serverURL: String) -> DevinAuth? {
+            DevinAuthStore(
+                files: FakeFiles([
+                    DevinAuthStore.credentialsPath: """
+                    windsurf_api_key = "devin-session-token$cli"
+                    api_server_url = "\(serverURL)"
+                    """
+                ]),
+                sqlite: FakeSQLite()
+            ).loadCredentialsFile()
+        }
 
-        let auth = store.loadCredentialsFile()
+        let https = load(serverURL: "https://server.codeium.test/")
+        XCTAssertEqual(https?.apiKey, "devin-session-token$cli")
+        XCTAssertEqual(https?.apiServerUrl, "https://server.codeium.test", "trailing slash cleaned")
 
-        XCTAssertEqual(auth?.apiKey, "devin-session-token$cli")
-        XCTAssertEqual(auth?.apiServerUrl, "https://server.codeium.test")
-        XCTAssertEqual(auth?.source, .credentialsFile)
-    }
-
-    func testIgnoresPlaintextServerURL() {
-        let store = DevinAuthStore(
-            files: FakeFiles([
-                DevinAuthStore.credentialsPath: """
-                windsurf_api_key = "devin-session-token$cli"
-                api_server_url = "http://server.codeium.test"
-                """
-            ]),
-            sqlite: FakeSQLite()
-        )
-
-        let auth = store.loadCredentialsFile()
-
-        XCTAssertEqual(auth?.apiKey, "devin-session-token$cli")
-        XCTAssertNil(auth?.apiServerUrl)
+        // A plaintext URL is dropped; the key still parses (proving the file parsed at all).
+        let http = load(serverURL: "http://server.codeium.test")
+        XCTAssertEqual(http?.apiKey, "devin-session-token$cli")
+        XCTAssertNil(http?.apiServerUrl)
     }
 
     func testReadsAppAuthFromSQLiteState() {
@@ -44,7 +32,6 @@ final class DevinAuthStoreTests: XCTestCase {
         let auth = store.loadAppAuth()
 
         XCTAssertEqual(auth?.apiKey, "devin-session-token$app")
-        XCTAssertEqual(auth?.source, .appState)
         XCTAssertEqual(sqlite.lastPath, DevinAuthStore.stateDBPath)
         XCTAssertEqual(sqlite.lastSQL?.contains("windsurfAuthStatus"), true)
     }
@@ -84,6 +71,7 @@ final class DevinUsageMapperTests: XCTestCase {
         planStatus["planInfo"] = planInfo
         planStatus["dailyQuotaRemainingPercent"] = 30
         planStatus.removeValue(forKey: "weeklyQuotaRemainingPercent")
+        planStatus.removeValue(forKey: "weeklyQuotaResetAtUnix")
         userStatus["planStatus"] = planStatus
 
         let mapped = try DevinUsageMapper.mapUserStatus(userStatus)
@@ -92,7 +80,43 @@ final class DevinUsageMapperTests: XCTestCase {
         // The hidden daily quota fills the missing Weekly row and is still flipped from "remaining"
         // to "used": 30% remaining -> 70% used (not passed through raw as 30).
         XCTAssertEqual(progress(mapped.lines, "Weekly quota")?.used, 70)
-        XCTAssertEqual(try XCTUnwrap(dollars(mapped.lines, "Extra usage balance")), 964.22, accuracy: 0.0001)
+    }
+
+    func testOmittedWeeklyRemainingWithResetMeansExhausted() throws {
+        for hideDailyQuota in [true, false] {
+            let body = Data("""
+            {"userStatus":{"planStatus":{
+                "planInfo":{"planName":"Max","hideDailyQuota":\(hideDailyQuota)},
+                "dailyQuotaRemainingPercent":100,
+                "dailyQuotaResetAtUnix":"1788940800",
+                "weeklyQuotaResetAtUnix":"1789286400",
+                "overageBalanceMicros":"-44347"
+            }}}
+            """.utf8)
+            let mapped = try DevinUsageMapper.mapUserStatusResponse(
+                HTTPResponse(statusCode: 200, headers: [:], body: body)
+            )
+            let weekly = try XCTUnwrap(progress(mapped.lines, "Weekly quota"))
+            XCTAssertEqual(weekly.used, 100)
+            XCTAssertEqual(weekly.limit, 100)
+            XCTAssertEqual(weekly.resetsAt, Date(timeIntervalSince1970: 1_789_286_400))
+            XCTAssertEqual(weekly.periodDurationMs, DevinUsageMapper.weekPeriodMs)
+        }
+    }
+
+    func testMalformedWeeklyRemainingWithResetThrowsInsteadOfExhausted() {
+        for malformed: Any in ["abc", true, Double.nan] {
+            var userStatus = makeUserStatus()
+            var planStatus = userStatus["planStatus"] as! [String: Any]
+            planStatus["weeklyQuotaRemainingPercent"] = malformed
+            planStatus["weeklyQuotaResetAtUnix"] = "1789286400"
+            userStatus["planStatus"] = planStatus
+
+            // Present but unparsable is schema drift → reject, never "100% used".
+            XCTAssertThrowsError(try DevinUsageMapper.mapUserStatus(userStatus)) { error in
+                XCTAssertEqual(error as? DevinUsageError, .invalidResponse)
+            }
+        }
     }
 
     func testThrowsQuotaUnavailableWhenNoDisplayableFieldsExist() {
@@ -116,7 +140,7 @@ final class DevinUsageMapperTests: XCTestCase {
 
     /// The first dollar value's raw number on a `.values` line (the shape extra-usage balance now uses).
     private func dollars(_ lines: [MetricLine], _ label: String) -> Double? {
-        guard case .values(_, let values, _, _) = lines.first(where: { $0.label == label }) else {
+        guard case .values(_, let values, _, _, _, _) = lines.first(where: { $0.label == label }) else {
             return nil
         }
         return values.first(where: { $0.kind == .dollars })?.number

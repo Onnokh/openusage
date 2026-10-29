@@ -1,7 +1,7 @@
 import XCTest
 @testable import OpenUsage
 
-/// Covers the Usage Trend feature: the per-day token sparkline built from ccusage daily data, its
+/// Covers the Usage Trend feature: the per-day token sparkline built from scanned daily data, its
 /// chart `MetricLine`, and how it flows through the descriptor / data store (non-pinnable, no-data safe).
 @MainActor
 final class UsageTrendTests: XCTestCase {
@@ -79,10 +79,10 @@ final class UsageTrendTests: XCTestCase {
     }
 
     func testTrendDropsDaysOlderThanTheWindow() {
-        // 40 distinct days (May 1–31, then June 1–9) with today = 6/9. The window is the 31 days ending
-        // today (5/10 … 6/9), so May 1–9 fall outside it and are dropped.
-        var daily = (1...31).map { DailyUsageEntry(date: String(format: "2026-05-%02d", $0), totalTokens: $0 * 1000, costUSD: nil) }
-        daily += (1...9).map { DailyUsageEntry(date: String(format: "2026-06-%02d", $0), totalTokens: $0 * 1000, costUSD: nil) }
+        let daily = [
+            DailyUsageEntry(date: "2026-05-09", totalTokens: 9_000, costUSD: nil),
+            DailyUsageEntry(date: "2026-05-10", totalTokens: 1_000, costUSD: nil)
+        ]
 
         var lines: [MetricLine] = []
         SpendTileMapper.appendUsageTrend(DailyUsageSeries(daily: daily), to: &lines, now: date(2026, 6, 9), note: "n")
@@ -91,6 +91,7 @@ final class UsageTrendTests: XCTestCase {
         XCTAssertEqual(points.count, 31)
         XCTAssertEqual(points.first?.label, dayLabel(2026, 5, 10), "days older than 30 back are outside the window")
         XCTAssertEqual(points.last?.label, dayLabel(2026, 6, 9), "window ends today")
+        XCTAssertEqual(points.map(\.value).reduce(0, +), 1_000, "out-of-window usage is excluded")
     }
 
     func testTrendAggregatesDuplicateDaysAndParsesCompactDates() {
@@ -138,10 +139,6 @@ final class UsageTrendTests: XCTestCase {
     func testUsageTrendDescriptorIsNotPinnable() {
         let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
         let descriptor = WidgetDescriptor.usageTrend(provider: provider)
-        XCTAssertEqual(descriptor.id, "claude.trend")
-        XCTAssertFalse(descriptor.pinnable)
-        XCTAssertTrue(descriptor.sample.isChart)
-
         let suite = makeDefaults("pinnable")
         let store = LayoutStore(
             registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
@@ -170,8 +167,8 @@ final class UsageTrendTests: XCTestCase {
     }
 
     func testChartTileWithoutABackingLineRendersNoData() {
-        // The placed tile with no `.chart` line must NOT leak the descriptor's gallery sample bars onto
-        // the dashboard — it falls back to the no-data state.
+        // A placed row with no `.chart` line must not treat descriptor template data as live usage — it
+        // falls back to the no-data state.
         let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
         let descriptor = WidgetDescriptor.usageTrend(provider: provider)
         let store = makeDataStore(provider: provider, descriptor: descriptor)
@@ -180,44 +177,8 @@ final class UsageTrendTests: XCTestCase {
         XCTAssertFalse(data.hasData)
     }
 
-    // MARK: - Hover coordinator (TrendHoverState)
-
-    func testHoverStateOpensThenClosesAroundBothRegions() async {
-        let state = TrendHoverState(revealDelay: .milliseconds(1), hideGrace: .milliseconds(1))
-        XCTAssertFalse(state.isPresented)
-
-        state.inlineHover(true)
-        try? await Task.sleep(for: .milliseconds(40))
-        XCTAssertTrue(state.isPresented, "opens after the reveal dwell while the row is hovered")
-
-        // Cursor crosses from the row into the popover: the row exits and the popover enters within grace.
-        state.inlineHover(false)
-        state.detailHover(true)
-        try? await Task.sleep(for: .milliseconds(40))
-        XCTAssertTrue(state.isPresented, "stays open while the cursor is inside the popover")
-
-        state.detailHover(false)
-        try? await Task.sleep(for: .milliseconds(40))
-        XCTAssertFalse(state.isPresented, "closes once the cursor has left both the row and the popover")
-    }
-
-    func testHoverStateQuickPassDoesNotOpen() async {
-        let state = TrendHoverState(revealDelay: .milliseconds(60), hideGrace: .milliseconds(1))
-        state.inlineHover(true)
-        state.inlineHover(false)   // left before the reveal dwell elapsed
-        try? await Task.sleep(for: .milliseconds(90))
-        XCTAssertFalse(state.isPresented, "a quick pass over the row never opens the popover")
-    }
-
-    func testHoverStateDismissForcesClosed() async {
-        let state = TrendHoverState(revealDelay: .milliseconds(1), hideGrace: .milliseconds(1))
-        state.inlineHover(true)
-        try? await Task.sleep(for: .milliseconds(40))
-        XCTAssertTrue(state.isPresented)
-
-        state.dismiss()
-        XCTAssertFalse(state.isPresented, "teardown closes it immediately")
-    }
+    // The hover-reveal coordinator is now the shared `HoverPopoverState`, covered once in
+    // ModelUsageHoverTests (open/close-around-both-regions, quick-pass, dismiss).
 
     // MARK: - Helpers
 

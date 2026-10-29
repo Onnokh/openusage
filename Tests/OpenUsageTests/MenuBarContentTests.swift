@@ -107,20 +107,8 @@ final class MenuBarContentTests: XCTestCase {
         XCTAssertEqual(content.groups[0].metrics.map(\.value), ["67%", "$12K", "412", "$42"])
     }
 
-    func testUnboundedNumbersAreCompacted() {
-        // Standard compact notation for big numbers; values shown in full drop their decimals.
-        let content = MenuBarContentBuilder.build(
-            groups: [group("a",
-                unbounded("a.big", "Big", 12923),         // → $12.9K
-                unbounded("a.small", "Small", 129.81))],  // → $130 (no decimals)
-            data: { $0.sample }
-        )
-
-        let big = content.groups[0].metrics[0].value
-        XCTAssertTrue(big.hasSuffix("K"), "expected compact thousands, got \(big)")
-        XCTAssertFalse(big.contains("923"), "expected the raw number to be compacted away, got \(big)")
-        XCTAssertEqual(content.groups[0].metrics[1].value, "$130")
-    }
+    // Compact-notation rules for tray values (abbreviation, decimal rounding) are pinned exactly in
+    // MetricFormatterTests — the strip only relays MetricFormatter output.
 
     // MARK: - Fixtures
 
@@ -134,23 +122,23 @@ final class MenuBarContentTests: XCTestCase {
     }
 
     private func percent(_ id: String, _ label: String, _ used: Double) -> WidgetDescriptor {
-        descriptor(id, label, WidgetData(title: label, icon: .symbol("gauge"), kind: .percent, used: used, limit: 100))
+        descriptor(id, label, WidgetData(title: label, icon: .providerMark("cursor"), kind: .percent, used: used, limit: 100))
     }
 
     private func boundedDollars(_ id: String, _ label: String, used: Double, limit: Double) -> WidgetDescriptor {
-        descriptor(id, label, WidgetData(title: label, icon: .symbol("gauge"), kind: .dollars, used: used, limit: limit))
+        descriptor(id, label, WidgetData(title: label, icon: .providerMark("cursor"), kind: .dollars, used: used, limit: limit))
     }
 
     private func boundedCount(_ id: String, _ label: String, used: Double, limit: Double) -> WidgetDescriptor {
-        descriptor(id, label, WidgetData(title: label, icon: .symbol("gauge"), kind: .count, used: used, limit: limit))
+        descriptor(id, label, WidgetData(title: label, icon: .providerMark("cursor"), kind: .count, used: used, limit: limit))
     }
 
     private func unbounded(_ id: String, _ label: String, _ used: Double = 42) -> WidgetDescriptor {
-        descriptor(id, label, WidgetData(title: label, icon: .symbol("gauge"), kind: .dollars, used: used, limit: nil))
+        descriptor(id, label, WidgetData(title: label, icon: .providerMark("cursor"), kind: .dollars, used: used, limit: nil))
     }
 
     private func noDataPercent(_ id: String, _ label: String) -> WidgetDescriptor {
-        var sample = WidgetData(title: label, icon: .symbol("gauge"), kind: .percent, used: 0, limit: 100)
+        var sample = WidgetData(title: label, icon: .providerMark("cursor"), kind: .percent, used: 0, limit: 100)
         sample.hasData = false
         return descriptor(id, label, sample)
     }

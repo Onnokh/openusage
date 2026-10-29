@@ -13,7 +13,7 @@ final class ProviderEnablementStoreTests: XCTestCase {
         XCTAssertTrue(store.isEnabled("a-provider-that-ships-next-year"))
     }
 
-    func testDisablingPersistsAcrossInstances() {
+    func testDisablingAndReenablingPersistAcrossInstances() {
         let defaults = makeDefaults("persist")
         let store = ProviderEnablementStore(defaults: defaults)
 
@@ -26,21 +26,15 @@ final class ProviderEnablementStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.disabledIDs, ["codex"])
         XCTAssertFalse(reloaded.isEnabled("codex"))
         XCTAssertTrue(reloaded.isEnabled("claude"))
-    }
 
-    func testReEnablingClearsDisabledStateAndPersists() {
-        let defaults = makeDefaults("re-enable")
-        let store = ProviderEnablementStore(defaults: defaults)
-
-        store.setEnabled(false, for: "grok")
-        store.setEnabled(true, for: "grok")
+        store.setEnabled(true, for: "codex")
 
         XCTAssertTrue(store.disabledIDs.isEmpty)
-        XCTAssertTrue(store.isEnabled("grok"))
+        XCTAssertTrue(store.isEnabled("codex"))
 
-        let reloaded = ProviderEnablementStore(defaults: defaults)
-        XCTAssertTrue(reloaded.disabledIDs.isEmpty)
-        XCTAssertTrue(reloaded.isEnabled("grok"))
+        let reenabled = ProviderEnablementStore(defaults: defaults)
+        XCTAssertTrue(reenabled.disabledIDs.isEmpty)
+        XCTAssertTrue(reenabled.isEnabled("codex"))
     }
 
     // MARK: - Early-refresh signal
@@ -76,6 +70,105 @@ final class ProviderEnablementStoreTests: XCTestCase {
         store.setEnabled(true, for: "codex")    // already enabled (no-op): must NOT fire
 
         XCTAssertEqual(enabledIDs, ["codex"])
+    }
+
+    // MARK: - Enabled-list mode (fresh installs)
+
+    func testSeedingSwitchesToEnabledListMode() {
+        let defaults = makeDefaults("seed")
+        let store = ProviderEnablementStore(defaults: defaults)
+
+        store.seedEnabledProviders(["claude", "codex"])
+
+        XCTAssertTrue(store.isEnabled("claude"))
+        XCTAssertTrue(store.isEnabled("codex"))
+        XCTAssertFalse(store.isEnabled("grok"))
+        // The key property of enabled-list mode: a provider shipped later defaults to OFF.
+        XCTAssertFalse(store.isEnabled("a-provider-that-ships-next-year"))
+
+        let reloaded = ProviderEnablementStore(defaults: defaults)
+        XCTAssertEqual(reloaded.enabledIDs, ["claude", "codex"])
+        XCTAssertTrue(reloaded.isEnabled("claude"))
+        XCTAssertFalse(reloaded.isEnabled("grok"))
+    }
+
+    func testTogglesPersistInEnabledListMode() {
+        let defaults = makeDefaults("enabled-toggles")
+        let store = ProviderEnablementStore(defaults: defaults)
+        store.seedEnabledProviders(["claude"])
+
+        store.setEnabled(true, for: "grok")
+        store.setEnabled(false, for: "claude")
+
+        let reloaded = ProviderEnablementStore(defaults: defaults)
+        XCTAssertEqual(reloaded.enabledIDs, ["grok"])
+        XCTAssertTrue(reloaded.isEnabled("grok"))
+        XCTAssertFalse(reloaded.isEnabled("claude"))
+    }
+
+    func testReseedFiresOnProviderEnabledForNewlyOnOnly() {
+        let store = ProviderEnablementStore(defaults: makeDefaults("reseed-enable"))
+        store.seedEnabledProviders(["claude", "codex"])
+        var enabledIDs: [String] = []
+        store.onProviderEnabled = { enabledIDs.append($0) }
+
+        // The detection pass replacing the fallback: codex stays on (no callback), grok turns on.
+        store.seedEnabledProviders(["codex", "grok"])
+
+        XCTAssertEqual(enabledIDs, ["grok"])
+    }
+
+    func testNoOpReseedDoesNotNotify() {
+        let store = ProviderEnablementStore(defaults: makeDefaults("reseed-noop"))
+        store.seedEnabledProviders(["claude"])
+        let notPosted = XCTNSNotificationExpectation(name: ProviderEnablementStore.didChangeNotification)
+        notPosted.isInverted = true
+
+        store.seedEnabledProviders(["claude"])
+
+        wait(for: [notPosted], timeout: 0.2)
+    }
+
+    func testLegacyModeIgnoresEnabledListUntilSeeded() {
+        // An existing install (disabled-list mode) must keep its semantics: absent enabled key means
+        // everything is on except the explicitly disabled IDs.
+        let defaults = makeDefaults("legacy-untouched")
+        defaults.set(["devin"], forKey: "openusage.disabledProviders.v1")
+        let store = ProviderEnablementStore(defaults: defaults)
+
+        XCTAssertNil(store.enabledIDs)
+        XCTAssertFalse(store.isEnabled("devin"))
+        XCTAssertTrue(store.isEnabled("claude"))
+        XCTAssertTrue(store.isEnabled("a-provider-that-ships-next-year"))
+    }
+
+    // MARK: - Known-provider set
+
+    func testRegisterKnownProvidersReturnsNewOnesAndPersists() {
+        let defaults = makeDefaults("known")
+        let store = ProviderEnablementStore(defaults: defaults)
+        XCTAssertTrue(store.knownIDs.isEmpty)
+
+        XCTAssertEqual(store.registerKnownProviders(["claude", "codex"]), ["claude", "codex"])
+        XCTAssertEqual(store.registerKnownProviders(["claude", "grok"]), ["grok"], "only never-seen IDs")
+        XCTAssertEqual(store.registerKnownProviders(["claude"]), [], "no-op re-registration")
+
+        let reloaded = ProviderEnablementStore(defaults: defaults)
+        XCTAssertEqual(reloaded.knownIDs, ["claude", "codex", "grok"])
+    }
+
+    func testRegisterKnownProvidersDoesNotTouchEnablement() {
+        // Pure bookkeeping: registering must not flip any toggle or wake the refresh loop.
+        let store = ProviderEnablementStore(defaults: makeDefaults("known-pure"))
+        store.seedEnabledProviders(["claude"])
+        let notPosted = XCTNSNotificationExpectation(name: ProviderEnablementStore.didChangeNotification)
+        notPosted.isInverted = true
+
+        store.registerKnownProviders(["claude", "grok"])
+
+        XCTAssertEqual(store.enabledIDs, ["claude"])
+        XCTAssertFalse(store.isEnabled("grok"))
+        wait(for: [notPosted], timeout: 0.2)
     }
 
     private func makeDefaults(_ name: String) -> UserDefaults {

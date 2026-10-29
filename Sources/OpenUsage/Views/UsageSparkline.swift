@@ -11,7 +11,8 @@ struct UsageSparkline: View {
     private let points: [MetricChartPoint]
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
-    @State private var hover = TrendHoverState()
+    @Environment(\.reduceAnimations) private var reduceAnimations
+    @State private var hover = HoverPopoverState()
 
     /// Widest the bar strip grows to, and a floor so it can't collapse to a sliver next to a long title.
     private static let maxChartWidth: CGFloat = 150
@@ -34,13 +35,29 @@ struct UsageSparkline: View {
             // Anchor the popover to the bar strip (not the whole row), so its arrow points straight up
             // at the chart rather than at the row's center, off to the left of the bars.
             bars
+                // Match the spend/reset value affordance: light the sparkline as soon as the pointer
+                // arrives, then hold the highlight while its detail popover is open so the chart still
+                // reads as the popover's source. `hover.dismiss()` clears both flags on panel close.
+                .background {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(.quaternary)
+                        .padding(.horizontal, -7)
+                        .padding(.vertical, -4)
+                        .opacity(showChartHighlight ? 1 : 0)
+                }
+                .animation(.easeOut(duration: 0.12), value: showChartHighlight)
                 // Only the bar strip is hoverable — hovering the title must not reveal the detail.
                 .contentShape(Rectangle())
                 .onContinuousHover { phase in
                     if case .active = phase { hover.inlineHover(true) } else { hover.inlineHover(false) }
                 }
-                .popover(isPresented: Binding(get: { hover.isPresented }, set: { hover.isPresented = $0 }),
-                         arrowEdge: .top) {
+                // Dismissing from outside (click-away) removes the detail view without an `.ended`
+                // hover event, so a plain assignment would strand `overDetail == true` and block
+                // future hides — reset the whole hover state instead.
+                .motionAwareHoverPopover(
+                    isPresented: Binding(get: { hover.isPresented }, set: { if !$0 { hover.dismiss() } }),
+                    reduceAnimations: reduceAnimations
+                ) {
                     UsageTrendDetail(title: data.title, points: points, note: data.chartNote) { inside in
                         hover.detailHover(inside)
                     }
@@ -49,6 +66,11 @@ struct UsageSparkline: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
         .onDisappear { hover.dismiss() }
+    }
+
+    /// Immediate pointer affordance plus a persistent source highlight while the popover is visible.
+    private var showChartHighlight: Bool {
+        hover.overInline || hover.isPresented
     }
 
     private var bars: some View {

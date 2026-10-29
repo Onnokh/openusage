@@ -1,14 +1,15 @@
 import SwiftUI
 
-/// Shared provider section header used by the dashboard, Customize, and lifted reorder previews.
-/// The name leads with the optional plan badge beside it; the provider mark sits at the trailing
-/// edge. Callers supply only an optional accessory after the mark (drag grip) and an optional
-/// `warning` — the latest refresh error, rendered as a small amber triangle beside the name whose
-/// hover tooltip carries the message (e.g. "Not logged in. Run `codex` to authenticate."). The
+/// Shared provider section header used by the dashboard and its lifted provider-reorder preview.
+/// The provider mark and name lead, followed by the optional plan badge. Dashboard callers supply a
+/// screenshot-copy action, revealed at the trailing edge while the header is hovered. Callers can also
+/// supply an optional `warning` — the latest refresh error, rendered as a small amber
+/// triangle beside the name whose hover tooltip carries the message (e.g. "Not logged in. Run `codex`
+/// to authenticate."). The
 /// optional `staleness` is the dashboard-only hint that the values shown are an aged snapshot still
 /// revalidating: a short "Outdated" tag whose hover tooltip carries the precise age ("Last updated 3h
 /// 12m ago"), so fossilized plan/limits never pass for current data.
-struct ProviderSectionHeader<Trailing: View>: View {
+struct ProviderSectionHeader: View {
     let provider: Provider
     var plan: String?
     var warning: String?
@@ -17,45 +18,48 @@ struct ProviderSectionHeader<Trailing: View>: View {
     /// the previous, possibly stale, numbers).
     var refreshing: Bool = false
     /// A muted "Outdated" hint shown only when the displayed snapshot has aged past its freshness window
-    /// (dashboard only; `nil` in Customize / reorder previews, which never surface staleness). Its tooltip
-    /// carries the precise age.
+    /// (dashboard only; `nil` in the reorder preview, which never surfaces staleness). Its tooltip carries
+    /// the precise age.
     var staleness: StalenessHint?
-    /// Dashboard-only: when true, a small dot-grid grip leads the name to signal the header line is
-    /// draggable (providers reorder by dragging the header). Off in Customize, which carries its own
-    /// trailing grip.
-    var showsDragHandle: Bool = false
-    private let trailing: Trailing
+    /// Dashboard-only screenshot action. The reorder preview omits it, while Customize uses its own
+    /// row type and is unaffected by this header.
+    var onCopyScreenshot: (() -> Bool)?
 
     /// Header type and icon track the density setting like the rows do, so Compact shrinks the
     /// whole section anatomy — not just the rows under it.
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+    /// Party easter egg: pulse the provider mark. Off by default everywhere else.
+    @Environment(\.popoverPartyMode) private var partyMode
+    @State private var isHovered = false
 
-    init(provider: Provider, plan: String? = nil, warning: String? = nil, refreshing: Bool = false, staleness: StalenessHint? = nil, showsDragHandle: Bool = false, @ViewBuilder trailing: () -> Trailing) {
+    init(
+        provider: Provider,
+        plan: String? = nil,
+        warning: String? = nil,
+        refreshing: Bool = false,
+        staleness: StalenessHint? = nil,
+        onCopyScreenshot: (() -> Bool)? = nil
+    ) {
         self.provider = provider
         self.plan = plan
         self.warning = warning
         self.refreshing = refreshing
         self.staleness = staleness
-        self.showsDragHandle = showsDragHandle
-        self.trailing = trailing()
+        self.onCopyScreenshot = onCopyScreenshot
     }
 
     var body: some View {
         HStack(spacing: 5) {
-            // A grip leading the name marks the header line as draggable to reorder providers. The
-            // whole line still carries the gesture; this just makes the affordance discoverable.
-            if showsDragHandle {
-                // Purely a visual affordance (the whole header line carries the drag gesture). The
-                // extra trailing gap keeps the grip from crowding the provider name beside it.
-                DragHandleGrip()
-                    .padding(.trailing, 4)
-            }
+            // The provider mark replaces the dashboard's visual drag grip. Reordering still belongs
+            // to the whole header at the caller, so the logo itself stays presentational.
+            ProviderIcon(source: provider.icon, inset: 0.04)
+                .frame(width: density.headerIconSize, height: density.headerIconSize)
+                .partyPulse(partyMode)
             // Baseline-aligned pair: the plan badge (and stale tag) are smaller type and sit on the
             // name's text baseline, so the words line up along the bottom rather than floating centered.
             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                // Name + plan keep their width and stay on one line; under width pressure (a long plan
-                // name like "Super Grok Heavy") the lower-priority stale tag truncates first instead of
-                // wrapping the name to a second line.
+                // Give the plan first choice of the available width, while still allowing an oversized
+                // plan to truncate. Account names and the lower-priority stale tag yield space first.
                 Text(provider.displayName)
                     .font(.system(size: density.headerPointSize, weight: .semibold))
                     .foregroundStyle(.primary)
@@ -63,7 +67,7 @@ struct ProviderSectionHeader<Trailing: View>: View {
                     .layoutPriority(1)
                 if let plan {
                     ProviderPlanBadge(plan: plan)
-                        .layoutPriority(1)
+                        .layoutPriority(2)
                 }
                 // Tertiary, below the plan in hierarchy: outdated content, not something the user acts on.
                 // Short by design ("Outdated") so it never pushes the plan name onto a second line — the
@@ -78,8 +82,7 @@ struct ProviderSectionHeader<Trailing: View>: View {
                 }
             }
             if refreshing {
-                ProgressView()
-                    .controlSize(.mini)
+                MotionAwareProgressView(controlSize: .mini)
                     .accessibilityLabel("Refreshing")
             } else if let warning {
                 Image(systemName: "exclamationmark.triangle.fill")
@@ -89,25 +92,19 @@ struct ProviderSectionHeader<Trailing: View>: View {
                     .accessibilityLabel(warning)
             }
             Spacer(minLength: 8)
-            // Match the menu-bar strip glyph: a near-zero inset lets the mark fill its box so the
-            // header logo reads at the same scale as the tray, instead of floating small inside the
-            // default list-context padding.
-            ProviderIcon(source: provider.icon, inset: 0.04)
-                .frame(width: density.headerIconSize, height: density.headerIconSize)
-            trailing
+            if let onCopyScreenshot {
+                CopyFeedbackButton(
+                    accessibilityLabel: "Copy \(provider.displayName) Screenshot",
+                    isRevealed: isHovered,
+                    action: onCopyScreenshot
+                )
+            }
         }
-        // With the grip leading, shave the left inset so the handle sits a touch closer to the card's
-        // left edge; Customize (no grip) keeps the symmetric inset so its name doesn't shift.
-        .padding(.leading, showsDragHandle ? 2 : 4)
+        .padding(.leading, 2)
         .padding(.trailing, 4)
         .padding(.vertical, 2)
         .contentShape(Rectangle())
-    }
-}
-
-extension ProviderSectionHeader where Trailing == EmptyView {
-    init(provider: Provider, plan: String? = nil, warning: String? = nil, refreshing: Bool = false, staleness: StalenessHint? = nil, showsDragHandle: Bool = false) {
-        self.init(provider: provider, plan: plan, warning: warning, refreshing: refreshing, staleness: staleness, showsDragHandle: showsDragHandle) { EmptyView() }
+        .onHover { isHovered = $0 }
     }
 }
 
@@ -134,30 +131,5 @@ struct ReorderGrip: View {
             .foregroundStyle(.tertiary)
             .frame(width: 16, height: 22)
             .contentShape(Rectangle())
-    }
-}
-
-/// The 2×3 dot-grid grip that leads the dashboard provider name. Kept quiet (tertiary) so it reads
-/// as an affordance hinting the header line can be dragged to reorder providers, not as a control
-/// competing with the name beside it.
-struct DragHandleGrip: View {
-    var body: some View {
-        VStack(spacing: 2) {
-            ForEach(0..<3) { _ in
-                HStack(spacing: 2) {
-                    dot
-                    dot
-                }
-            }
-        }
-        .frame(height: 22)
-        .contentShape(Rectangle())
-        .accessibilityHidden(true)
-    }
-
-    private var dot: some View {
-        Circle()
-            .fill(.tertiary)
-            .frame(width: 1.75, height: 1.75)
     }
 }

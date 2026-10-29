@@ -5,9 +5,8 @@ import Observation
 /// turn all three off to silence). All default OFF; the app requests notification authorization the
 /// first time a trigger is turned on, so a fresh install stays quiet until the user opts in.
 ///
-/// Persisted in `UserDefaults` (each key independently, so an unset key reads its `true` default and a
-/// future-added trigger defaults on without migration). `@Observable` so the Settings toggles and the
-/// evaluation in `WidgetDataStore` read live values.
+/// Persisted in `UserDefaults` (each key independently, with an unset key defaulting to `false`).
+/// `@Observable` lets the Settings toggles and `WidgetDataStore` evaluation read live values.
 @MainActor
 @Observable
 final class NotificationSettingsStore {
@@ -34,9 +33,9 @@ final class NotificationSettingsStore {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.underTenPercent = defaults.boolWithDefault(Self.underTenKey, default: false)
-        self.healthyToClose = defaults.boolWithDefault(Self.healthyToCloseKey, default: false)
-        self.closeToRunningOut = defaults.boolWithDefault(Self.closeToRunningOutKey, default: false)
+        self.underTenPercent = defaults.bool(forKey: Self.underTenKey, default: false)
+        self.healthyToClose = defaults.bool(forKey: Self.healthyToCloseKey, default: false)
+        self.closeToRunningOut = defaults.bool(forKey: Self.closeToRunningOutKey, default: false)
     }
 
     /// The per-milestone toggles as the pure logic consumes them.
@@ -52,13 +51,11 @@ final class NotificationSettingsStore {
     /// first trigger is turned on) and whether the Settings permission notice should show. Turning all
     /// three off silences everything.
     var anyEnabled: Bool { underTenPercent || healthyToClose || closeToRunningOut }
-}
 
-private extension UserDefaults {
-    /// `bool(forKey:)` returns `false` for an unset key, which can't express an opt-out default. This
-    /// reads the stored bool when present and falls back to `default` only when the key is genuinely
-    /// unset — so a default-on toggle starts on yet still honors a user's explicit off.
-    func boolWithDefault(_ key: String, default fallback: Bool) -> Bool {
-        object(forKey: key) as? Bool ?? fallback
+    /// Restores all three triggers to their default (off) — the Settings "Reset All Settings" path.
+    func resetToDefaults() {
+        underTenPercent = false
+        healthyToClose = false
+        closeToRunningOut = false
     }
 }

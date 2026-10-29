@@ -37,7 +37,7 @@ final class WidgetUsagePeriodTests: XCTestCase {
     /// A depleted balance (every value zero, not a usage period): `isZeroUsage` is still true, but the
     /// note gate `isZeroUsage && isUsagePeriod` is false, so no "No usage in this period" note shows.
     func testZeroBalanceRowIsGatedOutOfTheNote() {
-        var row = WidgetData(title: "Rate Limit Resets", icon: .symbol("clock"), kind: .count, used: 0,
+        var row = WidgetData(title: "Rate Limit Resets", icon: .providerMark("codex"), kind: .count, used: 0,
                              limit: nil, values: [MetricValue(number: 0, kind: .count)])
         row.isUsagePeriod = false
         XCTAssertTrue(row.isZeroUsage)
@@ -46,12 +46,36 @@ final class WidgetUsagePeriodTests: XCTestCase {
 
     /// A zero spend day (every value zero, a usage period): both true, so the note shows.
     func testZeroSpendPeriodKeepsTheNote() {
-        var row = WidgetData(title: "Today", icon: .symbol("clock"), kind: .dollars, used: 0, limit: nil,
+        var row = WidgetData(title: "Today", icon: .providerMark("codex"), kind: .dollars, used: 0, limit: nil,
                              values: [MetricValue(number: 0, kind: .dollars),
                                       MetricValue(number: 0, kind: .count)])
         row.isUsagePeriod = true
         XCTAssertTrue(row.isZeroUsage)
         XCTAssertTrue(row.isZeroUsage && row.isUsagePeriod)
+    }
+
+    func testUnknownModelWarningTooltipSingularAndPlural() {
+        var single = WidgetData(title: "Today", icon: .providerMark("cursor"), kind: .dollars, used: 0, limit: nil,
+                                values: [MetricValue(number: 1.0, kind: .dollars)])
+        single.unknownModels = ["GLM 5.2"]
+        XCTAssertTrue(single.hasUnknownModels)
+        XCTAssertEqual(single.unknownModelTooltip, "Unknown model found\n- GLM 5.2")
+
+        var many = single
+        many.unknownModels = ["GLM 5.2", "Some Other Model"]
+        XCTAssertEqual(many.unknownModelTooltip, "Unknown models found\n- GLM 5.2\n- Some Other Model")
+    }
+
+    func testNoUnknownModelsLeavesTriangleOff() {
+        var row = WidgetData(title: "Yesterday", icon: .providerMark("cursor"), kind: .dollars, used: 0, limit: nil,
+                             values: [MetricValue(number: 1.0, kind: .dollars)])
+        XCTAssertFalse(row.hasUnknownModels)
+        XCTAssertNil(row.unknownModelTooltip)
+        // A no-data tile never raises the warning even if names somehow rode along.
+        row.unknownModels = ["GLM 5.2"]
+        row.hasData = false
+        XCTAssertFalse(row.hasUnknownModels)
+        XCTAssertNil(row.unknownModelTooltip)
     }
 
     func testZeroSpendPeriodWithSourceNoteKeepsTheNoUsageTooltip() {
@@ -63,7 +87,6 @@ final class WidgetUsagePeriodTests: XCTestCase {
         row.valueTooltipNote = WidgetData.cursorUsageHistoryNote
 
         XCTAssertEqual(row.unboundedDetail, "$0.00 · 0 tokens")
-        XCTAssertNil(row.unboundedLabelTooltip)
         XCTAssertEqual(row.unboundedValueTooltip, "No usage in this period\n\(WidgetData.cursorUsageHistoryNote)")
     }
 }

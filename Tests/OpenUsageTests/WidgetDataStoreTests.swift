@@ -3,6 +3,70 @@ import XCTest
 
 @MainActor
 final class WidgetDataStoreTests: XCTestCase {
+    func testRefreshAllPersistsAndPublishesAllProviderSnapshots() async {
+        let fixtures = ["alpha", "beta", "gamma"].map { makeRuntime($0) }
+        let ids = fixtures.map { $0.0.id }
+        let defaults = makeUserDefaults("refresh-all-persists")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: fixtures.map { $0.0 }, descriptors: []),
+            providers: fixtures.map { $0.1 },
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots"),
+            defaults: defaults
+        )
+
+        await store.refreshAll()
+
+        XCTAssertEqual(Set(store.snapshots.keys), Set(ids))
+        let persisted = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots")
+            .loadSnapshots(providerIDs: ids)
+        XCTAssertEqual(Set(persisted.keys), Set(ids))
+    }
+
+    func testSingleProviderRefreshPersistsImmediately() async {
+        let fixture = makeRuntime("single")
+        let defaults = makeUserDefaults("single-refresh-persists")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [fixture.0], descriptors: []),
+            providers: [fixture.1],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots"),
+            defaults: defaults
+        )
+
+        await store.refresh(providerID: fixture.0.id, force: true)
+
+        let persisted = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots")
+            .loadSnapshots(providerIDs: [fixture.0.id])
+        XCTAssertNotNil(persisted[fixture.0.id])
+    }
+
+    func testFlushPendingSnapshotWorkPersistsDuringRefreshBatch() async {
+        let fast = makeRuntime("fast")
+        let slowProvider = Provider(id: "slow", displayName: "Slow", icon: .providerMark("codex"))
+        let slowSnapshot = ProviderSnapshot(providerID: slowProvider.id, displayName: slowProvider.displayName, lines: [])
+        let slow = SuspendedProviderRuntime(provider: slowProvider, snapshot: slowSnapshot)
+        let defaults = makeUserDefaults("flush-pending-snapshot-work")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [fast.0, slowProvider], descriptors: []),
+            providers: [fast.1, slow],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots"),
+            defaults: defaults
+        )
+        let refreshTask = Task { await store.refreshAll() }
+
+        for _ in 0..<1_000 where !slow.didStart { await Task.yield() }
+        for _ in 0..<1_000 where store.localSnapshots[fast.0.id] == nil { await Task.yield() }
+        XCTAssertTrue(slow.didStart)
+        XCTAssertNotNil(store.localSnapshots[fast.0.id])
+
+        store.flushPendingSnapshotWork()
+        let persisted = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots")
+            .loadSnapshots(providerIDs: [fast.0.id])
+        XCTAssertNotNil(persisted[fast.0.id])
+
+        slow.complete()
+        await refreshTask.value
+    }
+
     func testResolvesProgressSnapshotIntoWidgetData() async {
         let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
         let descriptor = WidgetDescriptor(
@@ -40,103 +104,116 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertEqual(data.valueText, "58%")
         XCTAssertEqual(data.boundedHeadline, "58% left")
         XCTAssertEqual(data.boundedSubtitle?.hasPrefix("Resets in "), true)
-        XCTAssertEqual(store.menuBarPrimaryText, "58%")
+    }
+
+    func testSoftWarningSurfacesOnHeaderWhilePartialDataStillLoads() async {
+        // A *successful* snapshot carrying a `warning` (e.g. Claude's "Re-login for live usage" when the
+        // login lacks user:profile) surfaces as the header's amber triangle via `warningMessage(for:)`,
+        // while the partial data still loads and it is NOT treated as a hard refresh error.
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("claude"))
+        let meter = WidgetDescriptor(
+            id: "test.session",
+            providerID: provider.id,
+            metricLabel: "Session",
+            sample: WidgetData(title: "Session", icon: provider.icon, kind: .percent, used: 0, limit: 100)
+        )
+        let runtime = TestProviderRuntime(
+            provider: provider,
+            descriptors: [meter],
+            snapshot: ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                lines: [.progress(label: "Session", used: 42, limit: 100, format: .percent)],
+                warning: "Re-login for live usage. Run `claude` and sign in again."
+            )
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter]),
+            providers: [runtime],
+            defaults: makeUserDefaults("soft-warning")
+        )
+
+        await store.refreshAll()
+
+        XCTAssertEqual(store.warningMessage(for: provider.id), "Re-login for live usage. Run `claude` and sign in again.")
+        XCTAssertNil(store.errorMessage(for: provider.id))  // soft warning, not a hard error
+        XCTAssertTrue(store.data(for: meter).hasData)       // partial data still loads
+    }
+
+    func testHardErrorTakesPrecedenceOverStaleSoftWarning() async {
+        // Bugbot: after a failed refresh the store keeps the last good snapshot (with its `warning`) while
+        // setting `providerErrors`. The header must show the current hard error, not the stale soft warning
+        // from the prior success — so `headerNotice(for:)` is `errorMessage ?? warningMessage`.
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("claude"))
+        let meter = WidgetDescriptor(
+            id: "test.session",
+            providerID: provider.id,
+            metricLabel: "Session",
+            sample: WidgetData(title: "Session", icon: provider.icon, kind: .percent, used: 0, limit: 100)
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter],
+            snapshots: [
+                ProviderSnapshot(
+                    providerID: provider.id,
+                    displayName: provider.displayName,
+                    lines: [.progress(label: "Session", used: 42, limit: 100, format: .percent)],
+                    warning: "Re-login for live usage."
+                ),
+                ProviderSnapshot.error(provider: provider, message: "Token expired. Run `claude` to log in again.")
+            ]
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter]),
+            providers: [runtime],
+            defaults: makeUserDefaults("header-notice")
+        )
+
+        await store.refreshAll(force: true)  // success with warning
+        XCTAssertEqual(store.warningMessage(for: provider.id), "Re-login for live usage.")
+        XCTAssertEqual(store.headerNotice(for: provider.id), "Re-login for live usage.")
+
+        await store.refreshAll(force: true)  // failure
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Token expired. Run `claude` to log in again.")
+        XCTAssertEqual(store.warningMessage(for: provider.id), "Re-login for live usage.")  // stale, still present
+        XCTAssertEqual(store.headerNotice(for: provider.id), "Token expired. Run `claude` to log in again.")  // error wins
     }
 
     func testRemainingProgressWithoutResetUsesPeriodDurationLabel() {
-        let session = WidgetData(
-            title: "Session",
-            icon: .providerMark("claude"),
-            kind: .percent,
-            used: 0,
-            limit: 100,
-            displayMode: .remaining,
-            resetsAt: nil,
-            periodDurationMs: ClaudeUsageMapper.sessionPeriodMs
-        )
-        XCTAssertEqual(session.boundedSubtitle, "Resets in 5h")
-
-        let weekly = WidgetData(
-            title: "Weekly",
-            icon: .providerMark("claude"),
-            kind: .percent,
-            used: 0,
-            limit: 100,
-            displayMode: .remaining,
-            resetsAt: nil,
-            periodDurationMs: ClaudeUsageMapper.weeklyPeriodMs
-        )
-        XCTAssertEqual(weekly.boundedSubtitle, "Resets in 7d")
-    }
-
-    func testDollarLimitSubtitleIsNotAReset() {
-        // A dollar limit subtitle is not a reset countdown; it renders as plain "$<limit> limit" text.
-        let onDemand = WidgetData(
-            title: "On-demand", icon: .providerMark("cursor"),
-            kind: .dollars, used: 0, limit: 100, limitNoun: "limit"
-        )
-        XCTAssertEqual(onDemand.boundedSubtitle, "$100 limit")
+        for (period, expected) in [
+            (ClaudeUsageMapper.sessionPeriodMs, "Resets in 5h"),
+            (ClaudeUsageMapper.weeklyPeriodMs, "Resets in 7d 0h")
+        ] {
+            let data = WidgetData(
+                title: "Usage", icon: .providerMark("claude"), kind: .percent,
+                used: 0, limit: 100, displayMode: .remaining, periodDurationMs: period
+            )
+            XCTAssertEqual(data.boundedSubtitle, expected)
+        }
     }
 
     func testDonutFractionMatchesRoundedHeadline() {
-        // 0.39% used reads "0%", so the ring must be empty (no sliver), not 0.0039.
-        let nearlyZero = WidgetData(
-            title: "Total usage",
-            icon: .providerMark("cursor"),
-            kind: .percent,
-            used: 0.3915,
-            limit: 100
-        )
-        XCTAssertEqual(nearlyZero.valueText, "0%")
-        XCTAssertEqual(nearlyZero.fraction, 0, accuracy: 0.0001)
-
-        // 0.6% rounds up to "1%", so the ring should match that 1%.
-        let roundsUp = WidgetData(
-            title: "Total usage",
-            icon: .providerMark("cursor"),
-            kind: .percent,
-            used: 0.6,
-            limit: 100
-        )
-        XCTAssertEqual(roundsUp.valueText, "1%")
-        XCTAssertEqual(roundsUp.fraction, 0.01, accuracy: 0.0001)
-
-        // 99.6% used reads "100%", so the ring should be full.
-        let nearlyFull = WidgetData(
-            title: "Total usage",
-            icon: .providerMark("cursor"),
-            kind: .percent,
-            used: 99.6,
-            limit: 100
-        )
-        XCTAssertEqual(nearlyFull.valueText, "100%")
-        XCTAssertEqual(nearlyFull.fraction, 1, accuracy: 0.0001)
+        for (used, headline, fraction) in [
+            (0.3915, "0%", 0.0), (0.6, "1%", 0.01), (99.6, "100%", 1.0)
+        ] {
+            let data = WidgetData(
+                title: "Total usage", icon: .providerMark("cursor"), kind: .percent,
+                used: used, limit: 100
+            )
+            XCTAssertEqual(data.valueText, headline)
+            XCTAssertEqual(data.fraction, fraction, accuracy: 0.0001)
+        }
     }
 
-    func testOnDemandDollarLimitAppendsLimitNoun() {
-        let onDemand = WidgetData(
-            title: "On-Demand",
-            icon: .providerMark("cursor"),
-            kind: .dollars,
-            used: 0,
-            limit: 100,
-            limitNoun: "limit"
-        )
-        XCTAssertEqual(onDemand.boundedSubtitle, "$100 limit")
-    }
-
-    func testCreditsDollarLimitAppendsLimitNoun() {
-        // Matches the original OpenUsage, which renders every bounded dollar metric's subtitle as
-        // "$X limit" — never "total".
-        let credits = WidgetData(
-            title: "Credits",
-            icon: .providerMark("cursor"),
-            kind: .dollars,
-            used: 0,
-            limit: 20,
-            limitNoun: "limit"
-        )
-        XCTAssertEqual(credits.boundedSubtitle, "$20 limit")
+    func testBoundedDollarSubtitlesAppendLimitNoun() {
+        for (title, limit, expected) in [("On-Demand", 100.0, "$100 limit"), ("Credits", 20.0, "$20 limit")] {
+            let data = WidgetData(
+                title: title, icon: .providerMark("cursor"), kind: .dollars,
+                used: 0, limit: limit, limitNoun: "limit"
+            )
+            XCTAssertEqual(data.boundedSubtitle, expected)
+        }
     }
 
     func testRequestsShowsBillingResetInsteadOfSuffix() {
@@ -150,7 +227,7 @@ final class WidgetDataStoreTests: XCTestCase {
             countSuffix: "requests",
             periodDurationMs: CursorUsageMapper.billingPeriodMs
         )
-        XCTAssertEqual(requests.boundedSubtitle, "Resets in 30d")
+        XCTAssertEqual(requests.boundedSubtitle, "Resets in 30d 0h")
     }
 
     func testCreditsRenderDollarAndCountCombinedInvariantToMeterStyle() async {
@@ -201,7 +278,8 @@ final class WidgetDataStoreTests: XCTestCase {
             id: "codex.rateLimitResets",
             provider: provider,
             title: "Rate Limit Resets",
-            metricLabel: "Rate Limit Resets"
+            metricLabel: "Rate Limit Resets",
+            traySuffix: "resets"
         )
         let runtime = TestProviderRuntime(
             provider: provider,
@@ -227,6 +305,45 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertFalse(data.isBounded)
         XCTAssertEqual(data.unboundedDetail, "1 available")
         XCTAssertEqual(data.menuBarValue, "1 resets")
+    }
+
+    func testZeroRateLimitResetsStillFlagsResetPopoverForEmptyState() async {
+        // The descriptor opt-in must survive resolve even at "0 available" (no expiries): that's exactly
+        // when the value column needs to stay a hover target so the popover can show the empty state.
+        let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
+        let descriptor = WidgetDescriptor.values(
+            id: "codex.rateLimitResets",
+            provider: provider,
+            title: "Rate Limit Resets",
+            metricLabel: "Rate Limit Resets",
+            traySuffix: "resets",
+            showsResetExpiries: true
+        )
+        let runtime = TestProviderRuntime(
+            provider: provider,
+            descriptors: [descriptor],
+            snapshot: ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                lines: [.values(label: "Rate Limit Resets",
+                                values: [MetricValue(number: 0, kind: .count, label: "available")])]
+            )
+        )
+        let defaults = makeUserDefaults("codex-resets-empty")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { Date() }),
+            defaults: defaults
+        )
+        await store.refreshAll()
+
+        let data = store.data(for: descriptor)
+        XCTAssertTrue(data.showsResetExpiries)
+        XCTAssertTrue(data.hasData)
+        XCTAssertTrue(data.expiriesAt.isEmpty)
+        XCTAssertNil(data.expirySeverity())          // no dot at zero
+        XCTAssertEqual(data.unboundedDetail, "0 available")
     }
 
     func testBoundedDollarAndCountTrayValuesHonorMeterStyleWithoutPercentConversion() async {
@@ -400,7 +517,7 @@ final class WidgetDataStoreTests: XCTestCase {
         )
         let registry = WidgetRegistry(providers: [provider], descriptors: descriptors)
         let cache = ProviderSnapshotCache(
-            userDefaults: makeUserDefaults("ccusage-estimate"),
+            userDefaults: makeUserDefaults("local-estimate"),
             storageKey: "snapshots",
             ttl: 600,
             now: { Date() }
@@ -412,7 +529,7 @@ final class WidgetDataStoreTests: XCTestCase {
         let costData = store.data(for: cost)
         XCTAssertEqual(costData.valueText, "$478.00")
         XCTAssertEqual(costData.unboundedDetail, "$478.00 spent")
-        XCTAssertEqual(costData.infoNote, WidgetData.ccusageEstimateNote)
+        XCTAssertEqual(costData.infoNote, WidgetData.localEstimateNote)
 
         // Tokens-only: the measured count with its "tokens" unit; the tooltip has every digit.
         let tokenData = store.data(for: tokens)
@@ -426,16 +543,13 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertEqual(combinedData.unboundedDetail, "$478.00 · 891K tokens")
         XCTAssertEqual(combinedData.menuBarValue, "$478")
         XCTAssertEqual(combinedData.unboundedTooltip, "$478.00 · 891,000 tokens")
-        XCTAssertEqual(combinedData.infoNote, WidgetData.ccusageEstimateNote)
+        XCTAssertEqual(combinedData.infoNote, WidgetData.localEstimateNote)
 
-        // Labels are inert. The value hover carries exact figures plus the source note.
-        XCTAssertNil(combinedData.unboundedLabelTooltip)
-        XCTAssertEqual(combinedData.unboundedValueTooltip, "$478.00 · 891,000 tokens\n\(WidgetData.ccusageEstimateNote)")
-        XCTAssertNil(costData.unboundedLabelTooltip)
-        XCTAssertEqual(costData.unboundedValueTooltip, "$478.00\n\(WidgetData.ccusageEstimateNote)")
+        // The value hover carries exact figures plus the source note.
+        XCTAssertEqual(combinedData.unboundedValueTooltip, "$478.00 · 891,000 tokens\n\(WidgetData.localEstimateNote)")
+        XCTAssertEqual(costData.unboundedValueTooltip, "$478.00\n\(WidgetData.localEstimateNote)")
         // The measured tokens tile has no source note, so it has only the exact-number value hover.
         XCTAssertNil(tokenData.infoNote)
-        XCTAssertNil(tokenData.unboundedLabelTooltip)
         XCTAssertEqual(tokenData.unboundedValueTooltip, "891,000 tokens")
 
         // An unpriced day (real tokens, no dollar): the cost-only tile finds no dollar value, so it reads
@@ -446,8 +560,9 @@ final class WidgetDataStoreTests: XCTestCase {
     }
 
     func testCursorSpendValueTooltipUsesUsageHistorySourceNote() async {
-        let provider = Provider(id: "cursor", displayName: "Cursor", icon: .providerMark("cursor"))
-        let combined = WidgetDescriptor.spendTiles(provider: provider).first { $0.id == "cursor.last30" }!
+        let cursor = CursorProvider()
+        let provider = cursor.provider
+        let combined = cursor.widgetDescriptors.first { $0.id == "cursor.last30" }!
         let runtime = TestProviderRuntime(
             provider: provider,
             descriptors: [combined],
@@ -468,78 +583,7 @@ final class WidgetDataStoreTests: XCTestCase {
         let data = store.data(for: combined)
         XCTAssertEqual(data.unboundedDetail, "$15.80 · 8.1B tokens")
         XCTAssertNil(data.infoNote)
-        XCTAssertNil(data.unboundedLabelTooltip)
         XCTAssertEqual(data.unboundedValueTooltip, "$15.80 · 8,100,000,000 tokens\n\(WidgetData.cursorUsageHistoryNote)")
-    }
-
-    /// `resolveText` builds the resolved row from the descriptor's sample but must reset the fields a
-    /// fresh text row never inherits (here `preservesRawText`, `limitNoun`, `resetsAt`,
-    /// `periodDurationMs`) to their `WidgetData` defaults — otherwise a verbatim-dollars sample would
-    /// leak its raw-text flag and a stray limit noun into the resolved value.
-    func testResolveTextResetsNonInheritedSampleFields() async {
-        let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
-        var sample = WidgetData(title: "Extra Usage", icon: provider.icon, kind: .dollars, used: 0, limit: nil)
-        sample.preservesRawText = true
-        sample.limitNoun = "cap"
-        sample.resetsAt = Date(timeIntervalSince1970: 1_800_000_000)
-        sample.periodDurationMs = 123_456
-        let descriptor = WidgetDescriptor(id: "codex.credits", providerID: provider.id,
-                                          metricLabel: "Credits", sample: sample)
-        let runtime = TestProviderRuntime(
-            provider: provider,
-            descriptors: [descriptor],
-            snapshot: ProviderSnapshot(
-                providerID: provider.id,
-                displayName: provider.displayName,
-                lines: [.text(label: "Credits", value: "$40.00 · 1,000 credits")]
-            )
-        )
-        let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
-            providers: [runtime],
-            defaults: makeUserDefaults("resolve-text-reset")
-        )
-        await store.refreshAll()
-        let data = store.data(for: descriptor)
-
-        XCTAssertEqual(data.used, 40.0)
-        // preservesRawText still drives the verbatim override above, but the resolved row's own flag
-        // resets to its default.
-        XCTAssertFalse(data.preservesRawText)
-        XCTAssertEqual(data.valueTextOverride, "$40.00 · 1,000 credits")
-        XCTAssertNil(data.limitNoun)
-        XCTAssertNil(data.resetsAt)
-        XCTAssertNil(data.periodDurationMs)
-    }
-
-    /// A `.percent` text row defaults a missing sample limit to a 100 scale and never carries an
-    /// `unboundedValueWord`, even when the sample (incorrectly) had one.
-    func testResolveTextPercentDefaultsLimitAndDropsUnboundedWord() async {
-        let provider = Provider(id: "p", displayName: "P", icon: .providerMark("p"))
-        var sample = WidgetData(title: "Usage", icon: provider.icon, kind: .percent, used: 0, limit: nil)
-        sample.unboundedValueWord = "left"
-        let descriptor = WidgetDescriptor(id: "p.usage", providerID: provider.id,
-                                          metricLabel: "Usage", sample: sample)
-        let runtime = TestProviderRuntime(
-            provider: provider,
-            descriptors: [descriptor],
-            snapshot: ProviderSnapshot(
-                providerID: provider.id,
-                displayName: provider.displayName,
-                lines: [.text(label: "Usage", value: "42")]
-            )
-        )
-        let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
-            providers: [runtime],
-            defaults: makeUserDefaults("resolve-text-percent")
-        )
-        await store.refreshAll()
-        let data = store.data(for: descriptor)
-
-        XCTAssertEqual(data.used, 42)
-        XCTAssertEqual(data.limit, 100)
-        XCTAssertNil(data.unboundedValueWord)
     }
 
     func testUsesFreshCachedSnapshotInsteadOfRefreshingProvider() async {
@@ -631,10 +675,73 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertEqual(store.data(for: descriptor).valueText, "20%")
     }
 
+    func testResetDisplaySettingsRestoresDefaultsAndPersists() {
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
+        let registry = WidgetRegistry(providers: [provider], descriptors: [])
+        let defaults = makeUserDefaults("reset-display-settings")
+        let store = WidgetDataStore(registry: registry, providers: [], defaults: defaults)
+        store.meterStyle = .used
+        store.resetDisplayMode = .absolute
+        store.alwaysShowPacing = true
+
+        store.resetDisplaySettings()
+
+        XCTAssertEqual(store.meterStyle, .remaining)
+        XCTAssertEqual(store.resetDisplayMode, .relative)
+        XCTAssertFalse(store.alwaysShowPacing)
+        // A second store on the same suite must load the defaults back, not the pre-reset values.
+        let reloaded = WidgetDataStore(registry: registry, providers: [], defaults: defaults)
+        XCTAssertEqual(reloaded.meterStyle, .remaining)
+        XCTAssertEqual(reloaded.resetDisplayMode, .relative)
+        XCTAssertFalse(reloaded.alwaysShowPacing)
+    }
+
     private func makeUserDefaults(_ name: String) -> UserDefaults {
         let suiteName = "OpenUsageTests.\(name).\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         return defaults
+    }
+
+    private func makeRuntime(_ id: String) -> (Provider, TestProviderRuntime) {
+        let provider = Provider(id: id, displayName: id.capitalized, icon: .providerMark("codex"))
+        return (
+            provider,
+            TestProviderRuntime(
+                provider: provider,
+                descriptors: [],
+                snapshot: ProviderSnapshot(
+                    providerID: provider.id,
+                    displayName: provider.displayName,
+                    lines: [.progress(label: "Session", used: 1, limit: 100, format: .percent)]
+                )
+            )
+        )
+    }
+}
+
+@MainActor
+private final class SuspendedProviderRuntime: ProviderRuntime {
+    let provider: Provider
+    let widgetDescriptors: [WidgetDescriptor] = []
+    private let snapshot: ProviderSnapshot
+    private(set) var didStart = false
+    private var continuation: CheckedContinuation<ProviderSnapshot, Never>?
+
+    init(provider: Provider, snapshot: ProviderSnapshot) {
+        self.provider = provider
+        self.snapshot = snapshot
+    }
+
+    func refresh() async -> ProviderSnapshot {
+        didStart = true
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func complete() {
+        continuation?.resume(returning: snapshot)
+        continuation = nil
     }
 }

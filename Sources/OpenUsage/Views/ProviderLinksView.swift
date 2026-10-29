@@ -7,10 +7,8 @@ import SwiftUI
 /// native card's expanded area (issue #596 — "bring back provider buttons").
 struct ProviderLinksView: View {
     let links: [ProviderLink]
-    /// Matches the metric-row inset so the button row lines up with the rows above/below it. The
-    /// expanded-metrics grid passes a tighter value; links keep the full inset since they sit on their
-    /// own line, not inside a narrow cell.
-    var horizontalInset: CGFloat = 14
+    /// Matches the metric-row inset so the button row lines up with the rows above/below it.
+    private static let horizontalInset: CGFloat = 14
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
@@ -30,7 +28,7 @@ struct ProviderLinksView: View {
                 linkButton(link)
             }
         }
-        .padding(.horizontal, horizontalInset)
+        .padding(.horizontal, Self.horizontalInset)
         .padding(.top, density.textRowPadding)
         .padding(.bottom, density.textRowPadding)
     }

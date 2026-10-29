@@ -3,14 +3,27 @@ import Foundation
 struct CopilotMappedUsage: Equatable, Sendable {
     var plan: String?
     var lines: [MetricLine]
+    /// True for an org-managed (token-based-billing) seat whose response carried no *percent* per-seat
+    /// meter — the signal that the real usage lives in *organization* billing, where the provider
+    /// should look next. Kept as an explicit flag so the org lookup is never gated on the incidental
+    /// shape of `lines` (see issue #839: a placeholder `overage_permitted` used to sneak an
+    /// "Extra Usage: 0" row in and block the lookup). `lines` isn't necessarily empty when this is
+    /// `true`: the same placeholder can still carry the user's own `credits_used`, shown as a personal
+    /// Credits count (issue #1094) — the provider must merge that with any org-billing lines rather
+    /// than replace it.
+    var isOrgManagedSeat: Bool = false
 }
 
-/// Normalizes the `/copilot_internal/user` response into progress meters. The endpoint reports each
-/// bucket as percent *remaining*; every meter flips that to percent *used*. Two response shapes are
-/// handled: paid plans expose `quota_snapshots` (Premium / Chat / Completions), free plans expose
-/// `limited_user_quotas` against `monthly_quotas` (Chat / Completions). Zero-entitlement placeholder
-/// snapshots — what GitHub returns for Copilot Business token-based-billing seats — carry no real quota
-/// signal and are suppressed rather than rendered as a misleading "0% used" bar.
+/// Normalizes the `/copilot_internal/user` response into meters. Since 2026-06-01 every plan is on
+/// usage-based billing (AI Credits), so the `premium_interactions` bucket is surfaced as **Credits**
+/// (used % of the monthly allotment), with **Extra Usage** carrying overage beyond it (emitted only
+/// alongside a real Credits meter — overage is meaningless without an included pool). Paid plans report
+/// `chat`/`completions` as the `-1` "unlimited" sentinel (suppressed); free plans carry real `chat` and
+/// `completions` counts — either inside `quota_snapshots` (current) or, on older responses, as
+/// `limited_user_quotas` against `monthly_quotas`. Zero-entitlement placeholder snapshots — what GitHub
+/// returns for Copilot Business token-based-billing seats — have no percent allotment and are not
+/// rendered as a misleading "0% used" bar. The same bucket can still carry a personal `credits_used`
+/// count (issue #1094), which is shown as unbounded Credits.
 enum CopilotUsageMapper {
     static let periodMs = MetricPeriod.monthMs
 
@@ -28,13 +41,28 @@ enum CopilotUsageMapper {
 
         var lines: [MetricLine] = []
 
-        // Paid tier: per-bucket quota snapshots.
+        // The metered premium pool is shown as "Credits"; overage beyond it as "Extra Usage". Extra
+        // Usage only exists relative to an included pool, so it's tied to the Credits meter: an
+        // org-managed placeholder can carry `overage_permitted: true` on a zero-entitlement bucket,
+        // and rendering "0" for it would be meaningless (and used to block the org-billing fallback).
         let snapshots = body["quota_snapshots"] as? [String: Any]
-        appendIfPresent(&lines, snapshotLine(label: "Premium", snapshots?["premium_interactions"], resetsAt: resetsAt))
+        let premium = snapshots?["premium_interactions"]
+        let creditsLine = snapshotLine(label: "Credits", premium, resetsAt: resetsAt)
+        appendIfPresent(&lines, creditsLine)
+        if creditsLine != nil {
+            appendIfPresent(&lines, overageLine(premium))
+        }
+
+        // Chat + completions: real per-bucket counts on free; the `-1` "unlimited" sentinel on paid
+        // (suppressed by `snapshotLine`). Older free responses without `quota_snapshots` fall back to
+        // `limited_user_quotas` / `monthly_quotas` below.
         appendIfPresent(&lines, snapshotLine(label: "Chat", snapshots?["chat"], resetsAt: resetsAt))
         appendIfPresent(&lines, snapshotLine(label: "Completions", snapshots?["completions"], resetsAt: resetsAt))
 
-        // Free tier: remaining counts (`limited_user_quotas`) against monthly limits (`monthly_quotas`).
+        // Legacy free-tier shape (predates `quota_snapshots`): remaining counts against monthly limits.
+        // Gated on nothing else having been produced — otherwise a paid account (Credits present,
+        // chat/completions suppressed as unlimited) that still carried `limited_user_quotas` would
+        // wrongly show free-tier meters alongside Credits.
         if lines.isEmpty {
             let limited = body["limited_user_quotas"] as? [String: Any]
             let monthly = body["monthly_quotas"] as? [String: Any]
@@ -42,15 +70,20 @@ enum CopilotUsageMapper {
             appendIfPresent(&lines, limitedLine(label: "Completions", remaining: limited?["completions"], total: monthly?["completions"], resetsAt: resetsAt))
         }
 
-        // Copilot Business / token-based-billing seats expose no per-seat quota — a legitimate empty
-        // state, not a failure. Surface the plan with empty meters (the tiles read "No data") so the
-        // dashboard still identifies the plan, instead of a loud error that drops it. A genuinely empty
-        // or garbled payload (no token-based-billing marker) is a real problem and fails loudly.
+        // Copilot Business / token-based-billing seats expose no per-seat percent quota — a legitimate
+        // empty state, not a failure. Surface the plan (and a personal Credits count when
+        // `credits_used` is present) so the dashboard still identifies the plan, instead of a loud
+        // error that drops it. A genuinely empty or garbled payload (no token-based-billing marker)
+        // is a real problem and fails loudly.
         guard !lines.isEmpty else {
-            if readBool(body["token_based_billing"]) == true {
-                return CopilotMappedUsage(plan: plan, lines: [])
+            guard ProviderParse.bool(body["token_based_billing"]) == true else {
+                throw CopilotUsageError.quotaUnavailable
             }
-            throw CopilotUsageError.quotaUnavailable
+            return CopilotMappedUsage(
+                plan: plan,
+                lines: personalCreditsLines(premium),
+                isOrgManagedSeat: true
+            )
         }
 
         return CopilotMappedUsage(plan: plan, lines: lines)
@@ -58,20 +91,21 @@ enum CopilotUsageMapper {
 
     // MARK: - Lines
 
-    /// A paid-tier `quota_snapshots` bucket → percent-used meter. `nil` for a missing bucket, an
-    /// `unlimited` bucket rendered as an empty (0% used) meter with no reset, or a zero-entitlement
-    /// placeholder seat (suppressed).
+    /// A `quota_snapshots` bucket → percent-used meter, or `nil` to suppress. Suppressed for: a missing
+    /// bucket; an `unlimited` bucket or the `-1` entitlement/remaining sentinel (paid chat & completions
+    /// under usage-based billing carry no real meter, so they're hidden rather than shown as a misleading
+    /// 0%); and a zero-entitlement placeholder (e.g. Credits on a free account, which has no allotment).
     private static func snapshotLine(label: String, _ raw: Any?, resetsAt: Date?) -> MetricLine? {
         guard let snapshot = raw as? [String: Any] else { return nil }
-
-        if readBool(snapshot["unlimited"]) == true {
-            return .progress(label: label, used: 0, limit: 100, format: .percent, resetsAt: nil, periodDurationMs: nil)
-        }
 
         let entitlement = ProviderParse.number(snapshot["entitlement"])
         let remaining = ProviderParse.number(snapshot["remaining"])
 
-        // Zero entitlement = no real allotment (token-based-billing placeholder). Drop it.
+        // Unlimited: the explicit flag, or GitHub's `-1` sentinel on entitlement/remaining. Suppress.
+        if ProviderParse.bool(snapshot["unlimited"]) == true || entitlement == -1 || remaining == -1 {
+            return nil
+        }
+        // Zero entitlement = no real allotment (token-based-billing placeholder, or Credits on free). Drop it.
         if entitlement == 0 { return nil }
 
         let usedPercent: Double
@@ -91,6 +125,35 @@ enum CopilotUsageMapper {
             resetsAt: resetsAt,
             periodDurationMs: periodMs
         )
+    }
+
+    /// Personal `credits_used` on an org-managed zero-entitlement placeholder. Used only after the
+    /// percent-based lines all come back empty. There's no allotment to show a percentage against, so
+    /// a real positive count is shown as unbounded Credits instead of leaving the card empty.
+    /// Extra Usage stays suppressed here: the placeholder can carry `overage_permitted: true` with
+    /// no included pool (issue #839). A zero or missing `credits_used` stays "No data".
+    private static func personalCreditsLines(_ raw: Any?) -> [MetricLine] {
+        guard let snapshot = raw as? [String: Any],
+              let creditsUsed = ProviderParse.number(snapshot["credits_used"]),
+              creditsUsed > 0
+        else {
+            return []
+        }
+        return [.values(label: "Credits", values: [MetricValue(number: creditsUsed, kind: .count)])]
+    }
+
+    /// "Extra Usage" — premium interactions consumed beyond the included Credits pool. Surfaced only once
+    /// the user has enabled additional (overage) spend (`overage_permitted`); a real zero is then shown
+    /// ("0"), per the show-real-zeros rule. When overage isn't enabled it's genuinely N/A → `nil`
+    /// ("No data"). No spending cap is exposed on this endpoint, so this is an unbounded count, not a meter.
+    private static func overageLine(_ raw: Any?) -> MetricLine? {
+        guard let snapshot = raw as? [String: Any],
+              ProviderParse.bool(snapshot["overage_permitted"]) == true
+        else {
+            return nil
+        }
+        let overage = max(0, ProviderParse.number(snapshot["overage_count"]) ?? 0)
+        return .values(label: "Extra Usage", values: [MetricValue(number: overage, kind: .count)])
     }
 
     /// A free-tier bucket: `remaining` against a `total` monthly limit → percent-used meter. `nil` unless
@@ -126,40 +189,26 @@ enum CopilotUsageMapper {
     }
 
     /// Parse a reset timestamp. Paid tier sends an ISO-8601 datetime (`quota_reset_date`, sometimes with
-    /// fractional seconds); free tier sends a bare `yyyy-MM-dd` date (`limited_user_reset_date`).
+    /// fractional seconds), handled by the shared `OpenUsageISO8601` normalizer; free tier sends a bare
+    /// `yyyy-MM-dd` date (`limited_user_reset_date`), the only Copilot-specific fallback kept here.
     private static func parseResetDate(_ value: Any?) -> Date? {
         guard let raw = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return nil
         }
-
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: raw) { return date }
-
-        let internet = ISO8601DateFormatter()
-        internet.formatOptions = [.withInternetDateTime]
-        if let date = internet.date(from: raw) { return date }
-
-        let dayOnly = DateFormatter()
-        dayOnly.calendar = Calendar(identifier: .gregorian)
-        dayOnly.locale = Locale(identifier: "en_US_POSIX")
-        dayOnly.timeZone = TimeZone(secondsFromGMT: 0)
-        dayOnly.dateFormat = "yyyy-MM-dd"
-        return dayOnly.date(from: raw)
+        if let date = OpenUsageISO8601.date(from: raw) { return date }
+        return dayOnlyFormatter.date(from: raw)
     }
 
-    private static func readBool(_ value: Any?) -> Bool? {
-        if let bool = value as? Bool { return bool }
-        if let number = value as? NSNumber { return number.boolValue }
-        if let string = value as? String {
-            switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "true", "1": return true
-            case "false", "0": return false
-            default: return nil
-            }
-        }
-        return nil
-    }
+    /// `nonisolated(unsafe)` is sound: `DateFormatter` is documented thread-safe on macOS 10.9+, and the
+    /// formatter is never mutated after creation (same pattern as `OpenUsageISO8601`).
+    private nonisolated(unsafe) static let dayOnlyFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
 }
 
 enum CopilotUsageError: Error, LocalizedError, Equatable {

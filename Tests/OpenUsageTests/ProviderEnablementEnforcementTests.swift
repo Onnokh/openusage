@@ -2,7 +2,7 @@ import XCTest
 @testable import OpenUsage
 
 /// Covers that the enable/disable choice is actually *enforced* everywhere a provider is consulted:
-/// the refresh loop, the menu-bar value, and the dashboard layout (visible tiles + Add-Widget gallery).
+/// the refresh loop, the menu-bar value, and the dashboard / Customize layout.
 @MainActor
 final class ProviderEnablementEnforcementTests: XCTestCase {
     // MARK: - WidgetDataStore refresh
@@ -38,53 +38,75 @@ final class ProviderEnablementEnforcementTests: XCTestCase {
         XCTAssertNil(store.snapshots["codex"])
     }
 
-    // MARK: - Menu-bar value
-
-    func testMenuBarPrimaryFollowsLayoutOrderAndFallsBackWhenAllDisabled() async {
-        let enablement = ProviderEnablementStore(defaults: makeDefaults("menubar-enablement"))
-
-        let codex = makeRuntime("codex", used: 80)
-        let claude = makeRuntime("claude", used: 30)
-        // Registry order is claude-first; layout order is codex-first. Tray ownership must follow the
-        // layout, proving it is order-driven rather than registry/alphabetical.
-        let registry = WidgetRegistry(
-            providers: [claude.provider, codex.provider],
-            descriptors: [claude.descriptor, codex.descriptor]
+    func testDisablingProviderRemovesPeerHistoryButKeepsLocalSnapshot() async throws {
+        let enablement = ProviderEnablementStore(defaults: makeDefaults("history-enablement"))
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        let historyDescriptor = UsageHistoryDescriptor(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "From test logs"
         )
-        let layout = LayoutStore(
-            registry: registry,
-            defaults: makeDefaults("menubar-layout"),
-            storageKey: "layout",
-            isProviderEnabled: { enablement.isEnabled($0) }
+        let descriptors = [
+            WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+                scope: historyDescriptor.scope,
+                estimatedCost: historyDescriptor.estimatedCost,
+                sourceNote: historyDescriptor.sourceNote
+            )
+        ] + WidgetDescriptor.spendTiles(provider: provider)
+        let now = Calendar.current.date(from: DateComponents(year: 2026, month: 7, day: 13, hour: 12))!
+        let localHistory = history(tokens: 100, cost: 1, now: now)
+        let localSnapshot = UsageHistorySnapshotRenderer.render(
+            local: ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                lines: [],
+                usageHistory: localHistory
+            ),
+            history: localHistory,
+            descriptor: historyDescriptor,
+            now: now,
+            combined: false
         )
-        layout.placed = [
-            PlacedWidget(descriptorID: codex.descriptor.id),
-            PlacedWidget(descriptorID: claude.descriptor.id)
-        ]
-        let suite = makeDefaults("menubar-store")
+        let runtime = CountingProviderRuntime(
+            provider: provider,
+            descriptors: descriptors,
+            snapshot: localSnapshot
+        )
+        let defaults = makeDefaults("history-store")
         let store = WidgetDataStore(
-            registry: registry,
-            providers: [codex.runtime, claude.runtime],
-            cache: ProviderSnapshotCache(userDefaults: suite, storageKey: "snapshots", ttl: 600, now: { Date() }),
-            defaults: suite,
+            registry: WidgetRegistry(providers: [provider], descriptors: descriptors),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots"),
+            defaults: defaults,
             isProviderEnabled: { enablement.isEnabled($0) },
-            orderedDescriptors: { layout.visiblePlaced.compactMap { layout.descriptor(for: $0) } }
+            now: { now }
         )
-        store.meterStyle = .used // headline = used value, so assertions read directly
-        await store.refreshAll()
+        enablement.onChange = { store.providerEnablementDidChange() }
 
-        XCTAssertEqual(store.menuBarPrimaryText, "80%") // codex is first in layout order
+        await store.refreshAll(force: true)
+        store.setPeerHistoryDocuments([
+            UsageHistoryDocument(
+                deviceID: "peer",
+                deviceName: "Peer Mac",
+                updatedAt: now,
+                providers: [provider.id: history(tokens: 200, cost: 2, now: now)]
+            )
+        ], ownDeviceID: "this-mac")
+        XCTAssertEqual(try spendTokens(store.snapshots[provider.id], label: "Today"), 300)
 
-        enablement.setEnabled(false, for: "codex")
-        XCTAssertEqual(store.menuBarPrimaryText, "30%") // codex hidden -> claude is first visible
+        enablement.setEnabled(false, for: provider.id)
 
-        enablement.setEnabled(false, for: "claude")
-        XCTAssertEqual(store.menuBarPrimaryText, WidgetData.noDataHeadline) // nothing visible -> no-data marker
+        XCTAssertEqual(try spendTokens(store.snapshots[provider.id], label: "Today"), 100)
+        XCTAssertNotNil(store.localSnapshots[provider.id])
+        XCTAssertNil(store.localHistoryDocument(deviceID: "this-mac", deviceName: "This Mac").providers[provider.id])
     }
+
+    // Tray ownership by layout order + disabled-provider exclusion is exercised on the real tray path
+    // (LayoutStore.pinnedGroups + MenuBarContentBuilder) in MenuBarPinTests / MenuBarContentTests.
 
     // MARK: - Layout
 
-    func testVisiblePlacedAndAvailableToAddExcludeDisabledProviderThenRestore() {
+    func testVisiblePlacedAndCustomizeGroupsExcludeDisabledProviderThenRestore() {
         let enablement = ProviderEnablementStore(defaults: makeDefaults("layout-enablement"))
         let layout = LayoutStore(
             registry: .mock,
@@ -95,7 +117,7 @@ final class ProviderEnablementEnforcementTests: XCTestCase {
 
         // All enabled => visiblePlaced is byte-for-byte the full placed list.
         XCTAssertEqual(layout.visiblePlaced, layout.placed)
-        XCTAssertTrue(layout.availableToAdd.contains { $0.providerID == "cursor" })
+        XCTAssertTrue(layout.customizeGroups.contains { $0.provider.id == "cursor" })
 
         enablement.setEnabled(false, for: "cursor")
 
@@ -103,12 +125,14 @@ final class ProviderEnablementEnforcementTests: XCTestCase {
         XCTAssertTrue(layout.visiblePlaced.contains { $0.descriptorID.hasPrefix("claude.") })
         // Disabling hides but does not delete: the Cursor tiles are still parked in `placed`.
         XCTAssertTrue(layout.placed.contains { $0.descriptorID.hasPrefix("cursor.") })
-        XCTAssertFalse(layout.availableToAdd.contains { $0.providerID == "cursor" })
+        XCTAssertFalse(layout.customizeGroups.contains { $0.provider.id == "cursor" })
+        XCTAssertEqual(layout.customizeProviderRows.first { $0.id == "cursor" }?.isEnabled, false)
 
         enablement.setEnabled(true, for: "cursor")
 
         XCTAssertEqual(layout.visiblePlaced, layout.placed)
-        XCTAssertTrue(layout.availableToAdd.contains { $0.providerID == "cursor" })
+        XCTAssertTrue(layout.customizeGroups.contains { $0.provider.id == "cursor" })
+        XCTAssertEqual(layout.customizeProviderRows.first { $0.id == "cursor" }?.isEnabled, true)
     }
 
     // MARK: - Helpers
@@ -144,6 +168,23 @@ final class ProviderEnablementEnforcementTests: XCTestCase {
             )
         )
         return Fixture(provider: provider, descriptor: descriptor, runtime: runtime)
+    }
+
+    private func history(tokens: Int, cost: Double, now: Date) -> ProviderUsageHistory {
+        ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(
+                date: DailyUsageAccumulator.dayKey(from: now),
+                totalTokens: tokens,
+                costUSD: cost
+            )
+        ]))
+    }
+
+    private func spendTokens(_ snapshot: ProviderSnapshot?, label: String) throws -> Double {
+        guard case .values(_, let values, _, _, _, _) = try XCTUnwrap(snapshot?.line(label: label)) else {
+            throw NSError(domain: "ProviderEnablementEnforcementTests", code: 1)
+        }
+        return try XCTUnwrap(values.first { $0.kind == .count }?.number)
     }
 
     private func makeDefaults(_ name: String) -> UserDefaults {

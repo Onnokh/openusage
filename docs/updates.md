@@ -7,19 +7,24 @@ they install, so you always get a genuine, unmodified build.
 ## How it works
 
 - **Automatic checks.** The app quietly checks for a new version in the background (about once an hour).
-  When one is found, it offers to download and install it. Because OpenUsage lives in the menu bar, it
-  briefly shows a Dock icon while the update window is open, then hides again.
+  When one is found, an **Update Available** banner appears at the top of the popover instead of a
+  window popping up behind your other apps. Click **Install Update** to open the update window (release
+  notes, download, install) front and center. The banner's close button snoozes it; it comes back the
+  next time the app finds the update.
 - **Manual check.** Open **Settings → Updates** and click **Check for Updates…** at any time.
-- **Turn it off.** The **Automatically Check for Updates** switch in **Settings → Updates** stops the
+  For both manual checks and banner installs, OpenUsage brings itself to the foreground before opening
+  Sparkle so the update window doesn't get buried behind another app. Because OpenUsage normally lives
+  only in the menu bar, it briefly shows a Dock icon for the update session, then hides again.
+- **Turn it off.** The **Check Automatically** switch in **Settings → Updates** stops the
   background checks. You can still check manually.
 
-## Early access
+## Beta updates
 
-**Settings → Updates → Early Access Updates** opts you into pre-release builds before they ship to
+**Settings → Updates → Beta Updates** opts you into pre-release builds before they ship to
 everyone. Turn it off to go back to stable-only; you'll stay on your current version until the next
 stable release catches up.
 
-Everyone always receives stable releases — early access only *adds* the pre-release builds on top.
+Everyone always receives stable releases — the beta option only *adds* pre-release builds on top.
 
 ## Where updates come from
 

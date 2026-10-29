@@ -35,20 +35,22 @@ final class ProviderSnapshotCacheTests: XCTestCase {
                        .progress(label: "Session", used: 20, limit: 100, format: .percent))
     }
 
-    func testWritesPersistForAFreshInstance() {
+    func testDeferredStorePersistsOnlyOnPersistPending() {
         let (defaults, suite) = makeDefaults()
         defer { defaults.removePersistentDomain(forName: suite) }
         let now = Date()
-        ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
-            .store(snapshot("alpha", used: 42, now: now))
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
 
-        // A fresh instance starts with an empty mirror, so the *display* read (`loadSnapshots`) proves the
-        // write reached disk — the mirror is a cache over persistence, not a replacement for it. (The
-        // freshness gate `snapshot(providerID:)` deliberately treats this disk-loaded value as stale; see
-        // `testRelaunchLoadedSnapshotIsStaleEvenWithinTTL`.)
-        let reloaded = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
-        XCTAssertEqual(reloaded.loadSnapshots(providerIDs: ["alpha"])["alpha"]?.lines.first,
-                       .progress(label: "Session", used: 42, limit: 100, format: .percent))
+        cache.store(snapshot("alpha", used: 10, now: now), persist: false)
+        cache.store(snapshot("beta", used: 20, now: now), persist: false)
+
+        XCTAssertEqual(cache.loadSnapshots(providerIDs: ["alpha", "beta"]).count, 2)
+        let beforeFlush = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
+        XCTAssertTrue(beforeFlush.loadSnapshots(providerIDs: ["alpha", "beta"]).isEmpty)
+
+        cache.persistPending()
+        let afterFlush = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
+        XCTAssertEqual(afterFlush.loadSnapshots(providerIDs: ["alpha", "beta"]).count, 2)
     }
 
     /// #697 core guarantee: a snapshot persisted by a *previous* session and reloaded on launch must not
@@ -65,24 +67,11 @@ final class ProviderSnapshotCacheTests: XCTestCase {
 
         // Session 2 (fresh instance = relaunch) reloads it from disk.
         let relaunched = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
-        // Display still paints the last-known value...
-        XCTAssertNotNil(relaunched.loadSnapshots(providerIDs: ["alpha"])["alpha"])
-        // ...but the refresh gate treats it as stale, forcing a refresh on the first post-launch pass.
+        XCTAssertEqual(
+            relaunched.loadSnapshots(providerIDs: ["alpha"])["alpha"]?.lines.first,
+            .progress(label: "Session", used: 42, limit: 100, format: .percent)
+        )
         XCTAssertNil(relaunched.snapshot(providerID: "alpha"))
-    }
-
-    /// Acceptance criterion 2: a snapshot written *this* session still short-circuits a redundant refresh
-    /// within that session (no refresh storm) — the gate is "written this session AND within TTL", not
-    /// "written this session" alone.
-    func testSnapshotWrittenThisSessionStaysFreshWithinTTL() {
-        let (defaults, suite) = makeDefaults()
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let now = Date()
-        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
-
-        cache.store(snapshot("alpha", used: 42, now: now))
-        XCTAssertEqual(cache.snapshot(providerID: "alpha")?.lines.first,
-                       .progress(label: "Session", used: 42, limit: 100, format: .percent))
     }
 
     /// A snapshot written this session still expires once it ages past TTL, so the periodic loop resumes

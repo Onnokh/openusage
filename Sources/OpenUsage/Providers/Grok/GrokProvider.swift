@@ -15,26 +15,42 @@ final class GrokProvider: ProviderRuntime {
     let usageClient: GrokUsageClient
     let logUsageScanner: GrokLogUsageScanner
     let now: @Sendable () -> Date
+    let pricing: @Sendable () async -> ModelPricing
 
     init(
         authStore: GrokAuthStore = GrokAuthStore(),
         usageClient: GrokUsageClient = GrokUsageClient(),
         logUsageScanner: GrokLogUsageScanner = GrokLogUsageScanner(),
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        pricing: @escaping @Sendable () async -> ModelPricing = { await ModelPricingStore.shared.current() }
     ) {
         self.authStore = authStore
         self.usageClient = usageClient
         self.logUsageScanner = logUsageScanner
         self.now = now
+        self.pricing = pricing
     }
 
     var widgetDescriptors: [WidgetDescriptor] {
         [
-            .percent(id: "grok.creditsUsed", provider: provider, title: "Monthly", metricLabel: "Credits used"),
+            .percent(id: "grok.weekly", provider: provider, title: "Weekly", metricLabel: "Weekly limit")
+                .exportingLimit("weekly", unit: "percent"),
             .badge(id: "grok.payAsYouGo", provider: provider, title: "Extra Usage", metricLabel: "Pay as you go"),
             .usageTrend(provider: provider)
-            // Local spend tiles, estimated from the Grok CLI log (see GrokLogUsageScanner).
+                .exportingHistory(
+                    scope: .machineLocal,
+                    estimatedCost: true,
+                    sourceNote: "From your Grok logs (estimated)"
+                )
+            // Local spend tiles from completed turns in the Grok CLI's session transcripts.
         ] + WidgetDescriptor.spendTiles(provider: provider)
+    }
+
+    func hasLocalCredentials() async -> Bool {
+        // Same source as `refresh()`: ~/.grok/auth.json with at least one keyed entry.
+        await loadOffMainActor { [authStore] in
+            ((try? authStore.loadAuthCandidates()) ?? []).isEmpty == false
+        }
     }
 
     func refresh() async -> ProviderSnapshot {
@@ -69,27 +85,65 @@ final class GrokProvider: ProviderRuntime {
     }
 
     private func probe(state: inout GrokAuthState, accessToken: String) async throws -> ProviderSnapshot {
-        let billingResponse = try await fetchBillingWithRetry(accessToken: accessToken, state: &state)
-        var mapped = try GrokUsageMapper.mapBillingResponse(billingResponse)
-        let plan = await fetchPlanName(accessToken: state.token)
-
-        // Local ccusage-style spend tiles, read natively from the Grok CLI log (no package runner).
-        // `scan` is awaited so its whole-file read + parse runs off the main actor.
-        if let tokenUsage = await logUsageScanner.scan(daysBack: 30, now: now()) {
-            SpendTileMapper.appendTokenUsage(tokenUsage, to: &mapped.lines, now: now())
-            SpendTileMapper.appendUsageTrend(tokenUsage, to: &mapped.lines, now: now(),
-                                             note: "Estimated from local logs at API rates")
+        // The weekly shared-pool meter and pay-as-you-go badge come from the billing endpoint with
+        // `?format=credits` — the call the Grok CLI itself makes. This is the provider's primary
+        // remote fetch; a failure here fails the provider like any other usage call, except the
+        // documented team-principal 412 which has no weekly pool to show.
+        let creditsResponse = try await fetchCreditsConfigWithRetry(accessToken: accessToken, state: &state)
+        var mapped: GrokMappedUsage
+        var warning: String?
+        if GrokUsageMapper.isTeamBillingUnavailable(creditsResponse) {
+            // Same shape as Claude's missing-profile-scope path: log it, keep the snapshot
+            // successful, and let local spend tiles load under an amber header warning.
+            AppLog.warn(
+                LogTag.plugin("grok"),
+                "credits config unavailable: team principal has no personal team; weekly/pay-as-you-go omitted, local spend still loads"
+            )
+            mapped = GrokMappedUsage(lines: [])
+            warning = GrokUsageMapper.teamBillingUnavailableWarning
+        } else {
+            mapped = try GrokUsageMapper.mapCreditsConfig(creditsResponse)
         }
 
-        return ProviderSnapshot.make(provider: provider, plan: plan, lines: mapped.lines, refreshedAt: now())
+        let plan = await fetchPlanName(accessToken: state.token)
+
+        // Local spend tiles from completed session turns. Recorded Grok costs win when available;
+        // older turns without a carried cost use the shared pricing store.
+        var usageHistory: ProviderUsageHistory?
+        if let scan = await logUsageScanner.scan(daysBack: 30, now: now(), pricing: await pricing()) {
+            usageHistory = ProviderUsageHistory(
+                series: scan.series,
+                modelUsage: scan.modelUsage,
+                unknownModelsByDay: scan.unknownModelsByDay
+            )
+            SpendTileMapper.appendTokenUsage(
+                scan.series,
+                to: &mapped.lines,
+                now: now(),
+                unknownModelsByDay: scan.unknownModelsByDay,
+                modelUsage: scan.modelUsage,
+                modelSourceNote: "From your Grok logs (estimated)"
+            )
+            SpendTileMapper.appendUsageTrend(scan.series, to: &mapped.lines, now: now(),
+                                             note: "From your Grok logs (estimated)")
+        }
+
+        return ProviderSnapshot.make(
+            provider: provider,
+            plan: plan,
+            lines: mapped.lines,
+            refreshedAt: now(),
+            usageHistory: usageHistory,
+            warning: warning
+        )
     }
 
-    private func fetchBillingWithRetry(accessToken: String, state: inout GrokAuthState) async throws -> HTTPResponse {
+    private func fetchCreditsConfigWithRetry(accessToken: String, state: inout GrokAuthState) async throws -> HTTPResponse {
         var working = state
         defer { state = working }
         return try await ProviderAuthRetry.fetch(
             token: accessToken,
-            attempt: { try await self.usageClient.fetchBilling(accessToken: $0) },
+            attempt: { try await self.usageClient.fetchCreditsConfig(accessToken: $0) },
             refreshAccessToken: {
                 guard let refreshed = await self.refreshAccessToken(state: &working) else {
                     throw GrokAuthError.expired

@@ -5,46 +5,56 @@ struct GrokMappedUsage: Equatable, Sendable {
 }
 
 enum GrokUsageMapper {
-    static func mapBillingResponse(_ response: HTTPResponse) throws -> GrokMappedUsage {
+    /// Map the credits-format billing response into the provider's remote lines: the Weekly meter
+    /// plus the pay-as-you-go badge. The Weekly line is omitted (the tile reads "No data") when the
+    /// account's current period isn't weekly — an account still on the old monthly-only billing has
+    /// no weekly pool, and mislabeling its monthly percent would be worse than an honest blank.
+    static func mapCreditsConfig(_ response: HTTPResponse) throws -> GrokMappedUsage {
         try ProviderAuthRetry.requireSuccess(
             response,
             authExpired: GrokAuthError.expired,
             requestFailed: { GrokUsageError.requestFailed($0) }
         )
-        guard let body = ProviderParse.jsonObject(response.body),
-              let config = body["config"] as? [String: Any],
-              let usedUnits = unitsValue(config["used"]),
-              let limitUnits = unitsValue(config["monthlyLimit"]),
-              limitUnits > 0,
-              let resetsAt = resetDate(config["billingPeriodEnd"])
-        else {
-            throw GrokUsageError.invalidResponse
-        }
+        let config = try GrokCreditsConfigDecoder.decode(responseBody: response.body)
 
-        // A SuperGrok account with no pay-as-you-go has no `onDemandCap` field at all. Treat a
-        // missing/non-numeric cap as 0 → the "Disabled" badge below, instead of failing the whole
-        // guard and surfacing a misleading "Grok billing response changed." A present cap of 0
-        // already mapped to Disabled and still does.
-        // NOTE: free-tier accounts (monthlyLimit == 0) still throw `invalidResponse` here — that
-        // payload shape is unconfirmed; revisit with a real sample before relaxing `limitUnits > 0`.
-        let onDemandCapUnits = unitsValue(config["onDemandCap"]) ?? 0
-
-        let usedPercent = ProviderParse.clampPercent((usedUnits / limitUnits) * 100)
-        return GrokMappedUsage(lines: [
-            .progress(
-                label: "Credits used",
-                used: usedPercent,
+        var lines: [MetricLine] = []
+        if config.periodType == GrokCreditsConfigDecoder.weeklyPeriodType {
+            lines.append(.progress(
+                label: "Weekly limit",
+                used: ProviderParse.clampPercent(config.usedPercent),
                 limit: 100,
                 format: .percent,
-                resetsAt: resetsAt
-            ),
-            .badge(
-                label: "Pay as you go",
-                text: onDemandCapUnits > 0 ? "\(formatUnits(onDemandCapUnits)) cap" : "Disabled",
-                colorHex: onDemandCapUnits > 0 ? "#22c55e" : "#a3a3a3"
-            )
-        ])
+                resetsAt: config.periodEnd,
+                periodDurationMs: config.periodDurationMs
+            ))
+        }
+        // A missing `onDemandCap` means no pay-as-you-go (proto-JSON also drops a 0 cap) → the
+        // Disabled badge, same as a present cap of 0.
+        lines.append(.badge(
+            label: "Pay as you go",
+            text: config.onDemandCap > 0 ? "\(formatUnits(config.onDemandCap)) cap" : "Disabled",
+            colorHex: config.onDemandCap > 0 ? "#22c55e" : "#a3a3a3"
+        ))
+        return GrokMappedUsage(lines: lines)
     }
+
+    /// HTTP 412 whose JSON `error` names "no personal team" is Grok's "this principal is a
+    /// team, not a personal team" signal from `GET /v1/billing?format=credits`. Auth is fine;
+    /// the weekly pool and pay-as-you-go cap simply aren't on this surface. Other 412s, and a
+    /// 412 whose body isn't that JSON shape, stay hard failures.
+    static func isTeamBillingUnavailable(_ response: HTTPResponse) -> Bool {
+        guard response.statusCode == 412,
+              let body = ProviderParse.jsonObject(response.body),
+              let error = body["error"] as? String
+        else { return false }
+        return error.localizedCaseInsensitiveContains("no personal team")
+    }
+
+    /// Provider header warning when the credits endpoint refuses a team principal. This is an
+    /// account shape, not a transient failure — Weekly / Extra Usage stay "No data"; local
+    /// spend tiles still load.
+    static let teamBillingUnavailableWarning =
+        "Team accounts have no personal quota. Spend below is still from your Grok logs."
 
     static func planName(from response: HTTPResponse) -> String? {
         guard (200..<300).contains(response.statusCode),
@@ -55,24 +65,6 @@ enum GrokUsageMapper {
         }
         let trimmed = plan.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func unitsValue(_ value: Any?) -> Double? {
-        guard let object = value as? [String: Any],
-              let number = ProviderParse.number(object["val"])
-        else {
-            return nil
-        }
-        return number.isFinite ? number : nil
-    }
-
-    private static func resetDate(_ value: Any?) -> Date? {
-        guard let raw = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty
-        else {
-            return nil
-        }
-        return OpenUsageISO8601.date(from: raw)
     }
 
     private static func formatUnits(_ value: Double) -> String {

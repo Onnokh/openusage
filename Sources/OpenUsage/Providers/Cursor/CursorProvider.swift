@@ -15,42 +15,58 @@ final class CursorProvider: ProviderRuntime {
     let authStore: CursorAuthStore
     let usageClient: CursorUsageClient
     let now: @Sendable () -> Date
+    let pricing: @Sendable () async -> ModelPricing
+    let spendHistoryBudget: TimeInterval
+    let usageHistoryStore: CursorUsageHistoryStore
 
     init(
         authStore: CursorAuthStore = CursorAuthStore(),
         usageClient: CursorUsageClient = CursorUsageClient(),
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        pricing: @escaping @Sendable () async -> ModelPricing = { await ModelPricingStore.shared.current() },
+        spendHistoryBudget: TimeInterval = 20,
+        usageHistoryStore: CursorUsageHistoryStore = CursorUsageHistoryStore()
     ) {
         self.authStore = authStore
         self.usageClient = usageClient
         self.now = now
+        self.pricing = pricing
+        self.spendHistoryBudget = spendHistoryBudget
+        self.usageHistoryStore = usageHistoryStore
     }
 
-    /// Cursor's usage-events CSV export (the source for the spend tiles + usage trend) started lagging
-    /// real time by ~12h+ in June 2026, so Today / Yesterday / Last 30 Days and the token trend would
-    /// show stale or empty data (e.g. "Today $0.00 · 0 tokens" mid-session). The cost lookup is disabled
-    /// until Cursor's reporting is timely again. Everything it needs stays in place — `CursorUsageCSV`,
-    /// `CursorPricing`, the bundled manifest, `CursorUsageMapper.appendSpendLines`, and the
-    /// `cursor.today/yesterday/last30/trend` entries in `DefaultLayout` (which `LayoutStore` ignores while
-    /// no descriptor exposes them) — so re-enabling is just flipping this flag back to `true`.
-    /// See https://github.com/robinebers/openusage/issues/758.
-    static let spendTrackingEnabled = false
-
     var widgetDescriptors: [WidgetDescriptor] {
-        var descriptors: [WidgetDescriptor] = [
-            .percent(id: "cursor.usage", provider: provider, title: "Total Usage", metricLabel: "Total usage"),
-            .percent(id: "cursor.auto", provider: provider, title: "Auto Usage", metricLabel: "Auto usage"),
-            .percent(id: "cursor.api", provider: provider, title: "API Usage", metricLabel: "API usage"),
-            .boundedDollars(id: "cursor.onDemand", provider: provider, title: "Extra Usage", metricLabel: "On-demand", limit: 100, valueWord: "spent"),
+        [
+            .percent(id: "cursor.usage", provider: provider, title: "Total Usage", metricLabel: "Total usage")
+                .exportingLimit("totalUsage", unit: "percent"),
+            .percent(id: "cursor.auto", provider: provider, title: "Cursor Models")
+                .exportingLimit("autoUsage", unit: "percent"),
+            .percent(id: "cursor.api", provider: provider, title: "Other Models")
+                .exportingLimit("apiUsage", unit: "percent"),
+            .percent(id: "cursor.grokBot", provider: provider, title: "Grok Bot", metricLabel: "Grok Bot usage")
+                .exportingLimit("grokBot", unit: "percent"),
+            .boundedDollars(id: "cursor.onDemand", provider: provider, title: "Extra Usage", metricLabel: "On-demand", limit: 100, valueWord: "spent")
+                .exportingLimit("onDemand", unit: "usd", source: .progressOrValue(kind: .dollars)),
             .boundedCount(id: "cursor.requests", provider: provider, title: "Requests", limit: 500,
-                          suffix: "requests", periodDurationMs: CursorUsageMapper.billingPeriodMs),
+                          suffix: "requests", periodDurationMs: CursorUsageMapper.billingPeriodMs)
+                .exportingLimit("requests", unit: "requests"),
             .dollarBalance(id: "cursor.credits", provider: provider, title: "Credits", valueWord: "left")
-        ]
-        if Self.spendTrackingEnabled {
-            descriptors.append(.usageTrend(provider: provider))
-            descriptors.append(contentsOf: WidgetDescriptor.spendTiles(provider: provider))
-        }
-        return descriptors
+                .exportingLimit("credits", kind: .balance, unit: "usd", source: .value(kind: .dollars)),
+            .usageTrend(provider: provider)
+                .exportingHistory(
+                    scope: .accountWide,
+                    estimatedCost: true,
+                    sourceNote: "From your Cursor usage history"
+                )
+        ] + WidgetDescriptor.spendTiles(
+            provider: provider,
+            valueTooltipNote: WidgetData.cursorUsageHistoryNote
+        )
+    }
+
+    func hasLocalCredentials() async -> Bool {
+        // Same source as `refresh()`: any auth state (state DB or keychain) counts.
+        await loadOffMainActor { [authStore] in authStore.loadAuthState() } != nil
     }
 
     func refresh() async -> ProviderSnapshot {
@@ -100,66 +116,169 @@ final class CursorProvider: ProviderRuntime {
         // The access token may have rotated during the usage fetch's refresh-and-retry; read the live one.
         let currentToken = authState.accessToken ?? accessToken
 
-        let (planName, planInfoUnavailable) = await fetchPlanName(accessToken: currentToken)
+        let (planInfoName, planInfoUnavailable) = await fetchPlanName(accessToken: currentToken)
+        let routingPlanName = CursorUsageMapper.routingPlanName(
+            planInfoName: planInfoName,
+            membershipType: authState.membershipType
+        )
+        let displayPlanName = CursorUsageMapper.resolvedPlanName(
+            planInfoName: planInfoName,
+            membershipType: authState.membershipType
+        )
         let fallback = CursorUsageMapper.shouldUseRequestBasedFallback(
             usage: usage,
-            planName: planName,
+            planName: routingPlanName,
             planInfoUnavailable: planInfoUnavailable
         )
         if fallback.shouldFallback {
-            let mapped = try await requestBasedResult(
+            var mapped = try await usageSummaryAndRequestResult(
                 accessToken: currentToken,
-                planName: planName,
+                planName: displayPlanName ?? routingPlanName,
                 unavailableMessage: fallback.message
             )
-            return snapshot(mapped)
+            await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
+            let history = await appendSpendLines(to: &mapped.lines, accessToken: currentToken)
+            return snapshot(mapped, usageHistory: history)
         }
 
         if shouldTryGenericRequestFallback(usage: usage) {
-            if let mapped = try? await requestBasedResult(
-                accessToken: currentToken,
-                planName: planName,
-                unavailableMessage: "Cursor request-based usage data unavailable. Try again later."
-            ) {
+            do {
+                var mapped = try await requestBasedResult(
+                    accessToken: currentToken,
+                    planName: displayPlanName ?? routingPlanName,
+                    unavailableMessage: "Cursor request-based usage data unavailable. Try again later."
+                )
+                await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
                 return snapshot(mapped)
+            } catch {
+                AppLog.warn(LogTag.plugin("cursor"), "optional request-based usage fallback failed")
             }
         }
 
         let creditGrants = await fetchCreditGrants(accessToken: currentToken)
-        let stripeResponse = try? await usageClient.fetchStripeBalance(accessToken: currentToken)
-        let stripeBalanceCents = CursorUsageMapper.stripeBalanceCents(from: stripeResponse ?? nil)
+        let stripeBalanceCents = await fetchStripeBalanceCents(accessToken: currentToken)
         var mapped = try CursorUsageMapper.mapUsage(
             usage: usage,
-            planName: planName,
+            planName: planInfoName,
             creditGrants: creditGrants,
             stripeBalanceCents: stripeBalanceCents
         )
-        if Self.spendTrackingEnabled {
-            await appendSpendLines(to: &mapped.lines, accessToken: currentToken)
-        }
-        return snapshot(mapped)
+        mapped.plan = CursorUsageMapper.resolvedPlanLabel(
+            planInfoName: planInfoName,
+            membershipType: authState.membershipType
+        )
+        await enrichPrimaryUsageFromSummaryIfNeeded(
+            accessToken: currentToken,
+            usage: usage,
+            planInfoName: planInfoName,
+            membershipType: authState.membershipType,
+            mapped: &mapped
+        )
+        await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
+        let history = await appendSpendLines(to: &mapped.lines, accessToken: currentToken)
+        return snapshot(mapped, usageHistory: history)
     }
 
-    /// Strictly additive: fetch the usage CSV and append the three per-day spend tiles. Any failure
-    /// (no session, non-2xx, or undecodable body) appends nothing, so the live Cursor mapping is never
-    /// affected and the spend tiles fall back to "No data".
-    ///
-    /// Currently dormant: only called when `spendTrackingEnabled` is true. Kept intact so re-enabling
-    /// Cursor spend tracking is a one-line flag flip (see `spendTrackingEnabled`).
-    private func appendSpendLines(to lines: inout [MetricLine], accessToken: String) async {
-        let calendar = Calendar.current
-        let end = now()
-        let startOfToday = calendar.startOfDay(for: end)
-        let start = calendar.date(byAdding: .day, value: -29, to: startOfToday) ?? startOfToday
+    /// Model-pool Enterprise/team seats often keep a usable primary usage payload but omit on-demand
+    /// there. usage-summary still carries Extra Usage for those accounts.
+    private func enrichPrimaryUsageFromSummaryIfNeeded(
+        accessToken: String,
+        usage: [String: Any],
+        planInfoName: String?,
+        membershipType: String?,
+        mapped: inout CursorMappedUsage
+    ) async {
+        let needsOnDemand = !mapped.lines.contains(where: { $0.label == "On-demand" })
+        let facts = CursorPlanUsageFacts(usage: usage)
+        let localIsOrg = membershipType.map { CursorUsageMapper.orgMembershipTypes.contains($0) } ?? false
+        // Only org / team-shaped seats: personal Pro model pools must not trigger usage-summary.
+        guard localIsOrg || facts.isTeamByShape else { return }
+        // Local org already fixed the badge; skip the extra call when Extra Usage is present.
+        if localIsOrg, !needsOnDemand { return }
 
-        guard let response = try? await usageClient.fetchUsageCSV(accessToken: accessToken, start: start, end: end),
-              (200..<300).contains(response.statusCode),
-              let csv = String(data: response.body, encoding: .utf8)
+        guard let summary = await fetchOptionalJSONObject(label: "usage-summary", request: {
+            try await self.usageClient.fetchUsageSummary(accessToken: accessToken)
+        }) else {
+            return
+        }
+        if !CursorUsageSummaryMapper.hasUsableSummaryPayload(summary) {
+            AppLog.warn(LogTag.plugin("cursor"), "optional usage-summary response contained no usable usage fields")
+            return
+        }
+        if needsOnDemand {
+            CursorUsageSummaryMapper.appendMissingOnDemand(from: summary, to: &mapped.lines)
+        }
+        let summaryMembership = (summary["membershipType"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        mapped.plan = CursorUsageMapper.resolvedPlanLabel(
+            planInfoName: planInfoName,
+            membershipType: CursorUsageMapper.preferredMembership(
+                local: membershipType,
+                summary: summaryMembership
+            )
+        ) ?? mapped.plan
+    }
+
+    /// Grok Bot uses the same Cursor account but keeps a separate weekly allowance. Missing access is
+    /// normal for ineligible accounts; malformed data and request failures remain visible in diagnostics.
+    private func appendGrokBotUsage(to lines: inout [MetricLine], accessToken: String) async {
+        guard let usage = await fetchOptionalJSONObject(label: "Grok Bot usage", request: {
+            try await self.usageClient.fetchGrokBotUsage(accessToken: accessToken)
+        }) else {
+            return
+        }
+        guard usage["usesPooledEnterpriseAllowance"] as? Bool != true,
+              usage["hasNonZeroIncludedLimit"] as? Bool != false,
+              usage["includedLimitZero"] as? Bool != true
         else {
             return
         }
-        let rows = CursorUsageCSV.parse(csv: csv)
-        CursorUsageMapper.appendSpendLines(rows: rows, now: end, to: &lines)
+        guard let line = CursorUsageMapper.mapGrokBotUsage(usage) else {
+            if usage["usagePercent"] != nil || usage["hasNonZeroIncludedLimit"] as? Bool == true ||
+                usage["hasAvailableUsage"] as? Bool == true {
+                AppLog.warn(LogTag.plugin("cursor"), "optional Grok Bot usage response contained invalid usage metadata")
+            }
+            return
+        }
+        lines.append(line)
+    }
+
+    /// Spend history is best-effort and never affects the live Cursor usage mapping.
+    private func appendSpendLines(to lines: inout [MetricLine], accessToken: String) async -> ProviderUsageHistory? {
+        guard let session = CursorUsageClient.session(from: accessToken) else {
+            AppLog.warn(LogTag.plugin("cursor"), "usage events could not be prepared from the current session")
+            return nil
+        }
+        let currentTime = now()
+        let fetcher = CursorSpendHistoryFetcher(
+            client: usageClient,
+            store: usageHistoryStore,
+            budget: spendHistoryBudget
+        )
+        guard let days = await fetcher.refresh(
+            accessToken: accessToken,
+            userID: session.userID,
+            now: currentTime
+        ) else {
+            return nil
+        }
+        let pricing = await pricing()
+        let rows = days.flatMap { dayStart, day in
+            day.models.map { model, tokens in
+                CursorUsageRow(
+                    date: dayStart,
+                    model: model,
+                    tokens: tokens,
+                    imputedCostDollars: pricing.estimatedCostDollars(
+                        model: model,
+                        tokens: tokens,
+                        applyLongContextRates: false
+                    )
+                )
+            }
+        }
+        return CursorUsageMapper.appendSpendLines(rows: rows, now: currentTime, pricing: pricing, to: &lines)
     }
 
     private func fetchUsageWithRetry(accessToken: String, authState: inout CursorAuthState) async throws -> HTTPResponse {
@@ -210,7 +329,10 @@ final class CursorProvider: ProviderRuntime {
         // fragment of that statement (JWTs aren't covered by log redaction). A generic error line keeps
         // it loud without risking a token leak. The refreshed token still works for this session.
         do {
-            try authStore.saveAccessToken(accessToken, source: authState.source)
+            let source = authState.source
+            try await loadOffMainActor { [authStore, accessToken, source] in
+                try authStore.saveAccessToken(accessToken, source: source)
+            }
         } catch {
             AppLog.error(LogTag.auth("cursor"), "failed to persist rotated access token to the Cursor state DB; using it for this session only")
         }
@@ -218,27 +340,86 @@ final class CursorProvider: ProviderRuntime {
     }
 
     private func fetchPlanName(accessToken: String) async -> (String?, Bool) {
-        do {
-            let response = try await usageClient.fetchPlan(accessToken: accessToken)
-            guard (200..<300).contains(response.statusCode),
-                  let body = ProviderParse.jsonObject(response.body),
-                  let planInfo = body["planInfo"] as? [String: Any]
-            else {
-                return (nil, true)
-            }
-            return (planInfo["planName"] as? String, false)
-        } catch {
+        guard let body = await fetchOptionalJSONObject(label: "plan", request: {
+            try await self.usageClient.fetchPlan(accessToken: accessToken)
+        }) else {
             return (nil, true)
         }
+        guard let planInfo = body["planInfo"] as? [String: Any],
+              let planName = (planInfo["planName"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfEmpty
+        else {
+            AppLog.warn(LogTag.plugin("cursor"), "optional plan response contained invalid plan metadata")
+            return (nil, true)
+        }
+        return (planName, false)
     }
 
     private func fetchCreditGrants(accessToken: String) async -> [String: Any]? {
-        guard let response = try? await usageClient.fetchCredits(accessToken: accessToken),
-              (200..<300).contains(response.statusCode)
-        else {
+        guard let body = await fetchOptionalJSONObject(label: "credit-grants", request: {
+            try await self.usageClient.fetchCredits(accessToken: accessToken)
+        }) else {
             return nil
         }
-        return ProviderParse.jsonObject(response.body)
+        // Enterprise seats often return a body without grant fields. That is not a schema error —
+        // only warn when Cursor claimed grants but the payload cannot be read.
+        guard let hasCreditGrants = body["hasCreditGrants"] as? Bool else {
+            if body["hasCreditGrants"] != nil {
+                AppLog.warn(LogTag.plugin("cursor"), "optional credit-grants response contained invalid grant metadata")
+            }
+            return nil
+        }
+        if hasCreditGrants {
+            guard let totalCents = ProviderParse.number(body["totalCents"]), totalCents > 0,
+                  let usedCents = ProviderParse.number(body["usedCents"]), usedCents >= 0 else {
+                AppLog.warn(LogTag.plugin("cursor"), "optional credit-grants response contained invalid grant metadata")
+                return nil
+            }
+        }
+        return body
+    }
+
+    private func fetchStripeBalanceCents(accessToken: String) async -> Double {
+        guard let body = await fetchOptionalJSONObject(label: "prepaid-balance", request: {
+            try await self.usageClient.fetchStripeBalance(accessToken: accessToken)
+        }) else {
+            return 0
+        }
+        guard ProviderParse.number(body["customerBalance"]) != nil else {
+            AppLog.warn(LogTag.plugin("cursor"), "optional prepaid-balance response contained invalid balance metadata")
+            return 0
+        }
+        return CursorUsageMapper.stripeBalanceCents(from: body)
+    }
+
+    /// Optional endpoints enrich a usable primary snapshot; they never fail the whole provider. Keep
+    /// their boundary handling in one place so transport, preparation, status, and schema failures are
+    /// all visible with fixed, credential-free diagnostics.
+    private func fetchOptionalJSONObject(
+        label: String,
+        request: () async throws -> HTTPResponse?
+    ) async -> [String: Any]? {
+        let response: HTTPResponse?
+        do {
+            response = try await request()
+        } catch {
+            AppLog.warn(LogTag.plugin("cursor"), "optional \(label) request failed")
+            return nil
+        }
+        guard let response else {
+            AppLog.warn(LogTag.plugin("cursor"), "optional \(label) request could not be prepared from the current session")
+            return nil
+        }
+        guard (200..<300).contains(response.statusCode) else {
+            AppLog.warn(LogTag.plugin("cursor"), "optional \(label) request returned HTTP \(response.statusCode)")
+            return nil
+        }
+        guard let body = ProviderParse.jsonObject(response.body) else {
+            AppLog.warn(LogTag.plugin("cursor"), "optional \(label) response was invalid")
+            return nil
+        }
+        return body
     }
 
     private func requestBasedResult(accessToken: String, planName: String?, unavailableMessage: String) async throws -> CursorMappedUsage {
@@ -257,17 +438,42 @@ final class CursorProvider: ProviderRuntime {
         }
     }
 
-    private func shouldTryGenericRequestFallback(usage: [String: Any]) -> Bool {
-        guard usage["enabled"] as? Bool != false,
-              let planUsage = usage["planUsage"] as? [String: Any]
-        else {
-            return false
+    private func usageSummaryAndRequestResult(
+        accessToken: String,
+        planName: String?,
+        unavailableMessage: String
+    ) async throws -> CursorMappedUsage {
+        let summary = await fetchOptionalJSONObject(label: "usage-summary", request: {
+            try await self.usageClient.fetchUsageSummary(accessToken: accessToken)
+        })
+        if let summary, !CursorUsageSummaryMapper.hasUsableSummaryPayload(summary) {
+            AppLog.warn(LogTag.plugin("cursor"), "optional usage-summary response contained no usable usage fields")
         }
-        return ProviderParse.number(planUsage["limit"]) == nil
-            && ProviderParse.number(planUsage["totalPercentUsed"]) == nil
+        let requestUsage = await fetchOptionalJSONObject(label: "request-based usage", request: {
+            try await self.usageClient.fetchRequestBasedUsage(accessToken: accessToken)
+        })
+        if let requestUsage, !CursorUsageSummaryMapper.hasUsableRequestPayload(requestUsage) {
+            AppLog.warn(LogTag.plugin("cursor"), "optional request-based usage response contained no usable usage fields")
+        }
+        return try CursorUsageSummaryMapper.map(
+            summary: summary,
+            requestUsage: requestUsage,
+            planName: planName,
+            unavailableMessage: unavailableMessage
+        )
     }
 
-    private func snapshot(_ mapped: CursorMappedUsage) -> ProviderSnapshot {
-        ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines, refreshedAt: now())
+    private func shouldTryGenericRequestFallback(usage: [String: Any]) -> Bool {
+        CursorPlanUsageFacts(usage: usage).shouldTryGenericRequestFallback
+    }
+
+    private func snapshot(_ mapped: CursorMappedUsage, usageHistory: ProviderUsageHistory? = nil) -> ProviderSnapshot {
+        ProviderSnapshot.make(
+            provider: provider,
+            plan: mapped.plan,
+            lines: mapped.lines,
+            refreshedAt: now(),
+            usageHistory: usageHistory
+        )
     }
 }

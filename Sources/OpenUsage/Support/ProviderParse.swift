@@ -18,15 +18,35 @@ enum ProviderParse {
         }
     }
 
-    /// Permissive numeric read: accepts JSON numbers and numeric strings, rejecting non-finite values.
+    /// Permissive numeric read: accepts JSON numbers and numeric strings, rejecting booleans and
+    /// non-finite values. `JSONSerialization` bridges booleans through `NSNumber`, so the Core
+    /// Foundation type check is required to keep `true`/`false` from becoming `1`/`0`.
     static func number(_ value: Any?) -> Double? {
         if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
             let doubleValue = number.doubleValue
             return doubleValue.isFinite ? doubleValue : nil
         }
         if let string = value as? String {
             let doubleValue = Double(string.trimmingCharacters(in: .whitespacesAndNewlines))
             return doubleValue?.isFinite == true ? doubleValue : nil
+        }
+        return nil
+    }
+
+    /// Permissive boolean read for `JSONSerialization` output: accepts real `Bool`s, numeric `NSNumber`s
+    /// (nonzero → true, via `boolValue`), and the strings "true"/"1"/"false"/"0" (case-insensitive).
+    /// Returns `nil` for anything else, so an absent or unrecognized field stays distinguishable from an
+    /// explicit false. `Bool` is tried before `NSNumber` so a JSON `0`/`1` bridges the same way either path.
+    static func bool(_ value: Any?) -> Bool? {
+        if let bool = value as? Bool { return bool }
+        if let number = value as? NSNumber { return number.boolValue }
+        if let string = value as? String {
+            switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1": return true
+            case "false", "0": return false
+            default: return nil
+            }
         }
         return nil
     }
@@ -46,7 +66,12 @@ enum ProviderParse {
     /// Decode `T` from JSON text, falling back to a hex-encoded JSON blob — some providers store their
     /// credentials/auth file as hex (optionally `0x`-prefixed) rather than plain JSON.
     static func decodeJSONWithHexFallback<T: Decodable>(_ text: String, as type: T.Type) -> T? {
-        if let decoded = decodeJSON(text, as: type) { return decoded }
+        decodeJSONWithHexFallback(text) { try? JSONDecoder().decode(type, from: $0) }
+    }
+
+    /// Also exposes the decoded bytes for callers that must preserve fields outside their model.
+    static func decodeJSONWithHexFallback<T>(_ text: String, decode: (Data) -> T?) -> T? {
+        if let decoded = decode(Data(text.utf8)) { return decoded }
 
         var hex = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if hex.hasPrefix("0x") || hex.hasPrefix("0X") {
@@ -65,12 +90,7 @@ enum ProviderParse {
             index = next
         }
         guard let decoded = String(bytes: bytes, encoding: .utf8) else { return nil }
-        return decodeJSON(decoded, as: type)
-    }
-
-    private static func decodeJSON<T: Decodable>(_ text: String, as type: T.Type) -> T? {
-        guard let data = text.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(type, from: data)
+        return decode(Data(decoded.utf8))
     }
 
     /// Decode a JWT's payload (the middle dot-separated segment) as a JSON object. Base64url is
@@ -91,12 +111,43 @@ enum ProviderParse {
         }
         return json
     }
+
+    /// Unwrap a `go-keyring-base64:`-prefixed value — how Go tools (`gh`, `agy`) store secrets in the
+    /// macOS Keychain — returning the decoded string. A value without the prefix is returned trimmed
+    /// as-is; an empty result is `nil`. Shared by every provider that reads a go-keyring-stored token.
+    static func unwrapGoKeyring(_ raw: String) -> String? {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "go-keyring-base64:"
+        if text.hasPrefix(prefix) {
+            let encoded = String(text.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let data = Data(base64Encoded: encoded),
+                  let decoded = String(data: data, encoding: .utf8)
+            else {
+                return nil
+            }
+            text = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text.nilIfEmpty
+    }
 }
 
 extension String {
-    /// Percent-encode for use as an `application/x-www-form-urlencoded` value.
+    /// Percent-encode one `application/x-www-form-urlencoded` value. Only the ASCII characters
+    /// RFC 3986 defines as unreserved pass through; spaces use `%20` so a literal `+` remains
+    /// distinguishable from a form-space separator.
     var urlFormEncoded: String {
-        addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? self
+        var encoded = ""
+        encoded.reserveCapacity(utf8.count)
+
+        for byte in utf8 {
+            switch byte {
+            case 0x41...0x5A, 0x61...0x7A, 0x30...0x39, 0x2D, 0x2E, 0x5F, 0x7E:
+                encoded.append(Character(UnicodeScalar(byte)))
+            default:
+                encoded.append(String(format: "%%%02X", byte))
+            }
+        }
+        return encoded
     }
 
     /// `nil` when the string is empty, otherwise the string itself — for treating "" as "missing".

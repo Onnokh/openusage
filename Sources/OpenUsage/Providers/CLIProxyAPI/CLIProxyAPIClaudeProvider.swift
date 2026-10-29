@@ -44,25 +44,37 @@ final class CLIProxyAPIClaudeProvider: ProviderRuntime {
     }
 
     /// One provider per account currently in the CLIProxyAPI auth dir. Read once at launch, because the
-    /// widget registry is fixed for the life of the process.
-    static func discover(authStore: CLIProxyAPIAuthStore = CLIProxyAPIAuthStore()) -> [CLIProxyAPIClaudeProvider] {
-        authStore.discoverClaudeAccounts().map { CLIProxyAPIClaudeProvider(account: $0, authStore: authStore) }
+    /// widget registry is fixed for the life of the process. `skipping` holds the `account|organization`
+    /// identity keys that already have a Claude card, so an account signed in to both Claude Code and
+    /// CLIProxyAPI shows once.
+    static func discover(
+        authStore: CLIProxyAPIAuthStore = CLIProxyAPIAuthStore(),
+        skipping claudeIdentityKeys: Set<String> = []
+    ) -> [CLIProxyAPIClaudeProvider] {
+        authStore.discoverClaudeAccounts()
+            .filter { !claudeIdentityKeys.contains($0.identityKey) }
+            .map { CLIProxyAPIClaudeProvider(account: $0, authStore: authStore) }
     }
 
     var widgetDescriptors: [WidgetDescriptor] {
         [
-            .percent(id: "\(provider.id).session", provider: provider, title: "Session"),
+            .percent(id: "\(provider.id).session", provider: provider, title: "Session", sessionStartSignal: .missingResetDate),
             .percent(id: "\(provider.id).weekly", provider: provider, title: "Weekly"),
+            .percent(id: "\(provider.id).fable", provider: provider, title: "Fable"),
             .percent(id: "\(provider.id).sonnet", provider: provider, title: "Sonnet"),
             .boundedDollars(id: "\(provider.id).extra", provider: provider, title: "Extra Usage", metricLabel: "Extra usage spent", limit: 100, valueWord: "spent")
         ]
     }
 
-    /// Layout defaults: all four meters on; Session and Weekly above the fold; only Session pinned, so
+    /// Layout defaults: every meter on; Session, Weekly and Fable above the fold; only Session pinned, so
     /// several accounts don't flood the menu bar.
     var defaultMetricIDs: [String] { widgetDescriptors.map(\.id) }
     var defaultExpandedMetricIDs: [String] { ["\(provider.id).sonnet", "\(provider.id).extra"] }
     var defaultPinnedMetricIDs: [String] { ["\(provider.id).session"] }
+
+    func hasLocalCredentials() async -> Bool {
+        await loadOffMainActor { [authStore, account] in authStore.loadAccount(path: account.path) != nil }
+    }
 
     func refresh() async -> ProviderSnapshot {
         let start = Date()
@@ -113,12 +125,9 @@ final class CLIProxyAPIClaudeProvider: ProviderRuntime {
     private func fetchPlan(token: String) async -> String? {
         do {
             let response = try await usageClient.fetchProfile(accessToken: token, config: ClaudeAuthStore().oauthConfig())
-            guard (200..<300).contains(response.statusCode) else {
-                AppLog.warn(LogTag.plugin(provider.id), "profile request failed: HTTP \(response.statusCode)")
-                return nil
-            }
-            guard let plan = Self.plan(fromProfile: response.body) else {
-                AppLog.warn(LogTag.plugin(provider.id), "profile response has no organization_type")
+            let profile = try ClaudeUsageClient.decodeProfile(response)
+            guard let plan = ClaudeUsageMapper.formatLivePlan(profile: profile, credentials: ClaudeOAuth(accessToken: token)) else {
+                AppLog.warn(LogTag.plugin(provider.id), "profile response has no organization plan")
                 return nil
             }
             return plan
@@ -126,18 +135,6 @@ final class CLIProxyAPIClaudeProvider: ProviderRuntime {
             AppLog.warn(LogTag.plugin(provider.id), "profile request failed: \(error.localizedDescription)")
             return nil
         }
-    }
-
-    /// Maps the profile's `organization_type` ("claude_max") and `rate_limit_tier`
-    /// ("default_claude_max_20x") to the label the main Claude card shows ("Max 20x").
-    static func plan(fromProfile body: Data) -> String? {
-        guard let organization = ProviderParse.jsonObject(body)?["organization"] as? [String: Any],
-              let type = organization["organization_type"] as? String
-        else {
-            return nil
-        }
-        let subscriptionType = type.hasPrefix("claude_") ? String(type.dropFirst("claude_".count)) : type
-        return ClaudeUsageMapper.formatPlan(subscriptionType: subscriptionType, rateLimitTier: organization["rate_limit_tier"] as? String)
     }
 
     private func rateLimitedSnapshot(credentials: ClaudeOAuth, retryAfterSeconds: Int?) -> ClaudeMappedUsage {

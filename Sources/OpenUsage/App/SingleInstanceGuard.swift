@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 /// Rejects a second copy of OpenUsage at launch (issue #635). macOS can fire two independent launch
 /// triggers on reboot — session restoration ("Reopen windows when logging back in") and the
@@ -30,7 +31,10 @@ enum SingleInstanceGuard {
     static func deferToExistingInstance() -> Bool {
         guard let bundleID = Bundle.main.bundleIdentifier else { return false }
         let me = NSRunningApplication.current
+        // Drop stale entries: yielding to a corpse can cascade into every copy terminating (the
+        // zero-survivor outcomes reproduced in #874).
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter(isAlive)
         guard let survivorPID = instanceToYieldTo(
             myPID: me.processIdentifier,
             runningPIDs: running.map(\.processIdentifier)
@@ -40,5 +44,25 @@ enum SingleInstanceGuard {
         // Resolved from the same snapshot the decision used, so the survivor is still present.
         running.first { $0.processIdentifier == survivorPID }?.activate()
         return true
+    }
+
+    /// Focus handoff without the lowest-PID decision: activates any other running copy with our
+    /// bundle identifier. Used when `SingleInstanceLock` already told us a peer owns the slot —
+    /// lock acquisition order is not PID order, so the peer may have a *higher* PID and
+    /// `deferToExistingInstance()` would skip the activation. Best-effort: in the snapshot-miss
+    /// race the peer may not be visible to LaunchServices yet, and that's fine — the lock, not
+    /// this handoff, is what decides who survives.
+    static func activateExistingInstance() {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        let myPID = NSRunningApplication.current.processIdentifier
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .first { $0.processIdentifier != myPID && isAlive($0) }?
+            .activate()
+    }
+
+    /// LaunchServices can briefly keep a just-terminated copy in its snapshot under load (#874).
+    /// `isTerminated` catches what it already knows; `kill(pid, 0)` asks the kernel directly.
+    private static func isAlive(_ app: NSRunningApplication) -> Bool {
+        !app.isTerminated && kill(app.processIdentifier, 0) == 0
     }
 }

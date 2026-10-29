@@ -10,6 +10,7 @@ Each card is named after the account's email, for example **Claude · onno**. Th
 |---|---|
 | Session | 5-hour rolling window usage |
 | Weekly | 7-day window usage |
+| Fable | Separate weekly Fable limit (plan-dependent) |
 | Sonnet | Separate weekly Sonnet limit (plan-dependent) |
 | Extra Usage | Extra-usage credits spent against your monthly cap |
 
@@ -24,6 +25,8 @@ OpenUsage reads the `claude-*.json` files in CLIProxyAPI's auth folder. It finds
 3. `~/.cli-proxy-api/config.yaml`
 
 If no config sets `auth-dir`, it uses `~/.cli-proxy-api`.
+
+If an account is also signed in to Claude Code or Claude Desktop, it already has a normal Claude card, so OpenUsage does not add a second card for it.
 
 Accounts are found when OpenUsage starts. **Restart OpenUsage after you add or remove an account in CLIProxyAPI.**
 

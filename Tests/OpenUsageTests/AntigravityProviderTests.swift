@@ -15,6 +15,28 @@ final class AntigravityProviderTests: XCTestCase {
         return resetsAt
     }
 
+    func testGoogleRefreshFormEncodesReservedCharactersInRequestBody() async throws {
+        let http = FakeHTTPClient(response: HTTPResponse(
+            statusCode: 200,
+            headers: [:],
+            body: Data(#"{"access_token":"new-token","expires_in":3600}"#.utf8)
+        ))
+        let client = AntigravityUsageClient(lsHTTP: http, http: http)
+
+        _ = await client.refreshGoogleToken("refresh token&=+/?%")
+
+        let request = try XCTUnwrap(http.requests.first)
+        XCTAssertEqual(request.method, "POST")
+        XCTAssertEqual(request.headers["Content-Type"], "application/x-www-form-urlencoded")
+        XCTAssertEqual(
+            String(data: try XCTUnwrap(request.body), encoding: .utf8),
+            "client_id=\(AntigravityUsageClient.googleClientID)" +
+                "&client_secret=\(AntigravityUsageClient.googleClientSecret)" +
+                "&refresh_token=refresh%20token%26%3D%2B%2F%3F%25" +
+                "&grant_type=refresh_token"
+        )
+    }
+
     // MARK: - Mapper: pooling
 
     func testBuildLinesPoolsAndOrders() {
@@ -27,10 +49,11 @@ final class AntigravityProviderTests: XCTestCase {
         ]
         let lines = AntigravityUsageMapper.buildLines(configs)
 
-        XCTAssertEqual(lines.map(\.label), ["Gemini Pro", "Gemini Flash", "Claude"])
-        XCTAssertEqual(used(lines[0]), 50)  // worst Gemini Pro fraction (0.5) -> 50% used
-        XCTAssertEqual(used(lines[1]), 0)   // Flash full
-        XCTAssertEqual(used(lines[2]), 70)  // worst non-Gemini (Claude 0.3) -> 70% used
+        // Pro and Flash share one pool since Antigravity's 2026-05-19 quota merge, so all Gemini
+        // models collapse into a single "Session" meter (worst fraction wins across the whole pool).
+        XCTAssertEqual(lines.map(\.label), ["Session", "Claude"])
+        XCTAssertEqual(used(lines[0]), 50)  // worst Gemini fraction (Pro Low 0.5) -> 50% used
+        XCTAssertEqual(used(lines[1]), 70)  // worst non-Gemini (Claude 0.3) -> 70% used
     }
 
     func testBuildLinesDedupKeepsWorstFractionAndItsReset() {
@@ -53,7 +76,7 @@ final class AntigravityProviderTests: XCTestCase {
             AntigravityModelConfig(label: "Gemini 3.1 Pro (High)", modelID: "ok", remainingFraction: 0.6, resetTime: nil)
         ]
         let lines = AntigravityUsageMapper.buildLines(configs)
-        XCTAssertEqual(lines.map(\.label), ["Gemini Pro"])
+        XCTAssertEqual(lines.map(\.label), ["Session"])
         XCTAssertEqual(used(lines[0]), 40)
     }
 
@@ -63,19 +86,21 @@ final class AntigravityProviderTests: XCTestCase {
             AntigravityModelConfig(label: "Claude Opus", modelID: "b", remainingFraction: -0.2, resetTime: nil)
         ]
         let lines = AntigravityUsageMapper.buildLines(configs)
-        XCTAssertEqual(used(lines.first { $0.label == "Gemini Pro" }), 0)   // clamped to full
-        XCTAssertEqual(used(lines.first { $0.label == "Claude" }), 100)     // clamped to empty
+        XCTAssertEqual(used(lines.first { $0.label == "Session" }), 0)   // clamped to full
+        XCTAssertEqual(used(lines.first { $0.label == "Claude" }), 100)  // clamped to empty
     }
 
     func testPoolLabelClassification() {
-        XCTAssertEqual(AntigravityUsageMapper.poolLabel("Gemini 3.1 Pro"), "Gemini Pro")
-        XCTAssertEqual(AntigravityUsageMapper.poolLabel("Gemini 3.5 Flash"), "Gemini Flash")
-        XCTAssertEqual(AntigravityUsageMapper.poolLabel("Gemini 3.1 Flash Lite"), "Gemini Flash")
+        // Pro and Flash merged into one shared Gemini pool (2026-05-19 quota restructure), shown as
+        // the "Session" meter.
+        XCTAssertEqual(AntigravityUsageMapper.poolLabel("Gemini 3.1 Pro"), "Session")
+        XCTAssertEqual(AntigravityUsageMapper.poolLabel("Gemini 3.5 Flash"), "Session")
+        XCTAssertEqual(AntigravityUsageMapper.poolLabel("Gemini 3.1 Flash Lite"), "Session")
         XCTAssertEqual(AntigravityUsageMapper.poolLabel("Claude Opus 4.6"), "Claude")
         XCTAssertEqual(AntigravityUsageMapper.poolLabel("GPT-OSS 120B"), "Claude")
-        // A Gemini model that is neither Pro nor Flash must stay in a Gemini pool, never Claude.
-        XCTAssertEqual(AntigravityUsageMapper.poolLabel("Gemini Ultra"), "Gemini Pro")
-        XCTAssertEqual(AntigravityUsageMapper.poolLabel("gemini-3"), "Gemini Pro")
+        // Any Gemini model must stay in the Gemini pool, never Claude.
+        XCTAssertEqual(AntigravityUsageMapper.poolLabel("Gemini Ultra"), "Session")
+        XCTAssertEqual(AntigravityUsageMapper.poolLabel("gemini-3"), "Session")
     }
 
     func testNormalizeLabelStripsTrailingParenthetical() {
@@ -110,7 +135,7 @@ final class AntigravityProviderTests: XCTestCase {
         let parsed = AntigravityUsageMapper.parseUserStatus(Data(json.utf8))
         XCTAssertEqual(parsed?.plan, "Pro")
         let lines = AntigravityUsageMapper.buildLines(parsed?.configs ?? [])
-        XCTAssertEqual(lines.map(\.label), ["Gemini Pro", "Claude"])
+        XCTAssertEqual(lines.map(\.label), ["Session", "Claude"])
         XCTAssertEqual(used(lines[0]), 50)
         XCTAssertEqual(used(lines[1]), 0)
         XCTAssertNotNil(resetsAt(lines[0]))
@@ -133,7 +158,7 @@ final class AntigravityProviderTests: XCTestCase {
         // isInternal (b) and empty-displayName (d) dropped at parse; blacklist (c) survives to buildLines.
         XCTAssertEqual(configs.count, 2)
         let lines = AntigravityUsageMapper.buildLines(configs)
-        XCTAssertEqual(lines.map(\.label), ["Gemini Pro"])  // c filtered by blacklist
+        XCTAssertEqual(lines.map(\.label), ["Session"])  // c filtered by blacklist
     }
 
     func testParseCloudCodeModelsTreatsMissingQuotaAsDepleted() {
@@ -151,13 +176,28 @@ final class AntigravityProviderTests: XCTestCase {
         XCTAssertEqual(AntigravityUsageMapper.parseLoadCodeAssistPlan(Data(json.utf8)), "Pro")
     }
 
+    func testParseLoadCodeAssistPlanPrefersPaidTierID() {
+        // The id wins over a name that would format differently (or not at all).
+        let ultraLite = #"{"currentTier":{"id":"standard-tier","name":"Gemini Code Assist"},"paidTier":{"id":"g1-ultra-lite-tier","name":"Google AI Ultra"}}"#
+        XCTAssertEqual(AntigravityUsageMapper.parseLoadCodeAssistPlan(Data(ultraLite.utf8)), "Ultra Lite")
+        let pro = #"{"paidTier":{"id":"g1-pro-tier"}}"#
+        XCTAssertEqual(AntigravityUsageMapper.parseLoadCodeAssistPlan(Data(pro.utf8)), "Pro")
+        // An unknown id falls back to the name.
+        let unknown = #"{"paidTier":{"id":"g1-new-tier","name":"Google AI Plus"}}"#
+        XCTAssertEqual(AntigravityUsageMapper.parseLoadCodeAssistPlan(Data(unknown.utf8)), "Plus")
+        // Without client metadata the response has only allowedTiers — no plan.
+        let allowedOnly = #"{"allowedTiers":[{"id":"standard-tier","name":"Gemini Code Assist"}]}"#
+        XCTAssertNil(AntigravityUsageMapper.parseLoadCodeAssistPlan(Data(allowedOnly.utf8)))
+    }
+
     func testParseQuotaBuckets() {
         let json = """
         {"buckets":[{"modelId":"gemini-3-pro-preview","remainingFraction":0.5,"resetTime":"2026-06-27T04:44:01Z"},
                     {"modelId":"gemini-3-flash-preview","remainingFraction":1}]}
         """
         let lines = AntigravityUsageMapper.buildLines(AntigravityUsageMapper.parseQuotaBuckets(Data(json.utf8)))
-        XCTAssertEqual(lines.map(\.label), ["Gemini Pro", "Gemini Flash"])
+        // Pro and Flash buckets pool into the one "Session" meter; the worst fraction (0.5) wins.
+        XCTAssertEqual(lines.map(\.label), ["Session"])
         XCTAssertEqual(used(lines[0]), 50)
     }
 
@@ -239,25 +279,49 @@ final class AntigravityProviderTests: XCTestCase {
     func testLoadCachedTokenAppliesRefreshBuffer() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         func store(expiresInSeconds: Double) -> AntigravityAuthStore {
-            let ms = (now.timeIntervalSince1970 + expiresInSeconds) * 1000
-            let files = FakeFiles([AntigravityAuthStore.cachePath: #"{"accessToken":"ya29.cached","expiresAtMs":\#(ms)}"#])
-            return AntigravityAuthStore(keychain: FakeKeychain(nil), files: files, now: { now })
+            let store = AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles(), now: { now })
+            store.cacheToken(
+                "ya29.cached",
+                expiresIn: expiresInSeconds,
+                sourceRefreshToken: "refresh"
+            )
+            return store
         }
+        let source = AntigravityKeychainToken(accessToken: nil, refreshToken: "refresh", expiry: nil)
         // Within the 60s refresh buffer -> treated as expired (avoids a near-certain 401 + extra refresh).
-        XCTAssertNil(store(expiresInSeconds: 30).loadCachedToken())
-        XCTAssertEqual(store(expiresInSeconds: 7200).loadCachedToken(), "ya29.cached")
+        XCTAssertNil(store(expiresInSeconds: 30).loadCachedToken(matching: source))
+        XCTAssertEqual(store(expiresInSeconds: 7200).loadCachedToken(matching: source), "ya29.cached")
     }
 
-    func testLoadKeychainTokenThroughStore() {
+    func testLoadKeychainTokenThroughStore() throws {
         let inner = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r"}}"#
         let wrapped = "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
         let store = AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles())
-        let token = store.loadKeychainToken()
+        let token = try store.loadKeychainToken()
         XCTAssertEqual(token?.accessToken, "ya29.kc")
         XCTAssertEqual(token?.refreshToken, "1//r")
     }
 
     // MARK: - Provider integration (Cloud Code path, no language server)
+
+    /// A provider on the Cloud Code path (no language server), signed in via a wrapped keychain
+    /// token. Pass `keychainExpiry: nil` for a signed-out provider (empty keychain).
+    @MainActor
+    private func makeCloudCodeProvider(
+        routing: RoutingHTTPClient,
+        keychainExpiry: String? = "2099-01-01T00:00:00Z"
+    ) -> AntigravityProvider {
+        let wrapped = keychainExpiry.map { expiry in
+            let inner = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"\#(expiry)"}}"#
+            return "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
+        }
+        return AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectories: { ["/nonexistent-antigravity-tests"] })
+        )
+    }
 
     @MainActor
     func testRefreshUsesCloudCodeWhenNoLanguageServer() async {
@@ -272,6 +336,10 @@ final class AntigravityProviderTests: XCTestCase {
 
         let routing = RoutingHTTPClient { request in
             let path = request.url.path
+            // Builds without the summary RPC 404 it — this test also covers summary-404 → legacy.
+            if path.contains("retrieveUserQuotaSummary") {
+                return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+            }
             if path.contains("fetchAvailableModels") {
                 return HTTPResponse(statusCode: 200, headers: [:], body: Data(modelsJSON.utf8))
             }
@@ -281,31 +349,20 @@ final class AntigravityProviderTests: XCTestCase {
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
 
-        let inner = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2099-01-01T00:00:00Z"}}"#
-        let wrapped = "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
-
-        let provider = AntigravityProvider(
-            authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
-            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
-            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner())
-        )
+        let provider = makeCloudCodeProvider(routing: routing)
 
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.plan, "Pro")
-        XCTAssertEqual(snapshot.lines.map(\.label), ["Gemini Pro", "Gemini Flash", "Claude"])
+        // Legacy per-model data merges into the two pool meters (worst fraction per pool).
+        XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Claude"])
         XCTAssertEqual(used(snapshot.lines[0]), 60)
-        XCTAssertEqual(used(snapshot.lines[1]), 0)
-        XCTAssertEqual(used(snapshot.lines[2]), 30)
+        XCTAssertEqual(used(snapshot.lines[1]), 30)
     }
 
     @MainActor
     func testRefreshErrorsWhenNothingAvailable() async {
         let routing = RoutingHTTPClient { _ in HTTPResponse(statusCode: 500, headers: [:], body: Data()) }
-        let provider = AntigravityProvider(
-            authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
-            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
-            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner())
-        )
+        let provider = makeCloudCodeProvider(routing: routing, keychainExpiry: nil)
         let snapshot = await provider.refresh()
         XCTAssertTrue(snapshot.lines.contains { $0.isError })
         XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
@@ -316,13 +373,7 @@ final class AntigravityProviderTests: XCTestCase {
         // Valid keychain token, but every Cloud Code endpoint is down. A signed-in user should see a
         // transient failure (.network), not "not signed in" (.notLoggedIn).
         let routing = RoutingHTTPClient { _ in HTTPResponse(statusCode: 503, headers: [:], body: Data()) }
-        let inner = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2099-01-01T00:00:00Z"}}"#
-        let wrapped = "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
-        let provider = AntigravityProvider(
-            authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
-            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
-            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner())
-        )
+        let provider = makeCloudCodeProvider(routing: routing)
         let snapshot = await provider.refresh()
         XCTAssertTrue(snapshot.lines.contains { $0.isError })
         XCTAssertEqual(snapshot.errorCategory, .network)
@@ -338,13 +389,7 @@ final class AntigravityProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 503, headers: [:], body: Data())
         }
-        let inner = #"{"token":{"access_token":"ya29.old","refresh_token":"1//dead","expiry":"2000-01-01T00:00:00Z"}}"#
-        let wrapped = "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
-        let provider = AntigravityProvider(
-            authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
-            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
-            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner())
-        )
+        let provider = makeCloudCodeProvider(routing: routing, keychainExpiry: "2000-01-01T00:00:00Z")
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.errorCategory, .authExpired)
     }
@@ -360,13 +405,7 @@ final class AntigravityProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 401, headers: [:], body: Data())
         }
-        let inner = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2099-01-01T00:00:00Z"}}"#
-        let wrapped = "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
-        let provider = AntigravityProvider(
-            authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
-            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
-            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner())
-        )
+        let provider = makeCloudCodeProvider(routing: routing)
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.errorCategory, .network)
     }
@@ -381,13 +420,7 @@ final class AntigravityProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 503, headers: [:], body: Data())
         }
-        let inner = #"{"token":{"access_token":"ya29.old","refresh_token":"1//r","expiry":"2000-01-01T00:00:00Z"}}"#
-        let wrapped = "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
-        let provider = AntigravityProvider(
-            authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
-            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
-            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner())
-        )
+        let provider = makeCloudCodeProvider(routing: routing, keychainExpiry: "2000-01-01T00:00:00Z")
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.errorCategory, .network)
     }
@@ -407,13 +440,7 @@ final class AntigravityProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 503, headers: [:], body: Data())
         }
-        let inner = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2099-01-01T00:00:00Z"}}"#
-        let wrapped = "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
-        let provider = AntigravityProvider(
-            authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
-            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
-            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner())
-        )
+        let provider = makeCloudCodeProvider(routing: routing)
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.errorCategory, .network)
     }
@@ -421,14 +448,14 @@ final class AntigravityProviderTests: XCTestCase {
 
 /// Returns empty output for every subprocess — makes language-server discovery find nothing, so a
 /// provider test exercises the Cloud Code path deterministically.
-private struct EmptyProcessRunner: ProcessRunning {
+struct EmptyProcessRunner: ProcessRunning {
     func run(executable: String, arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> ProcessResult {
         ProcessResult(exitCode: 0, stdout: "", stderr: "")
     }
 }
 
 /// Serial call counter for routing handlers that must vary their response across requests.
-private final class Counter: @unchecked Sendable {
+final class Counter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
     func next() -> Int {
