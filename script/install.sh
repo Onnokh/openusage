@@ -47,7 +47,9 @@ APP_MACOS="$APP_CONTENTS/MacOS"
 APP_RESOURCES="$APP_CONTENTS/Resources"
 APP_BINARY="$APP_MACOS/$TARGET_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
-ENTITLEMENTS="$ROOT_DIR/script/OpenUsage.dev.entitlements.plist"
+# The dev entitlements carry iCloud keys that only launch with a matching provisioning profile; this
+# install embeds none, so it signs without them and iCloud Sync stays off.
+ENTITLEMENTS="$ROOT_DIR/script/OpenUsage.local.entitlements.plist"
 INSTALL_PATH="/Applications/$APP_DISPLAY.app"
 
 pkill -x "$TARGET_NAME" >/dev/null 2>&1 || true
