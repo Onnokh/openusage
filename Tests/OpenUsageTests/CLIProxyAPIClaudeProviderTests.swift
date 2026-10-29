@@ -53,20 +53,6 @@ final class CLIProxyAPIAuthStoreTests: XCTestCase {
         XCTAssertNotEqual(accounts[0].providerID, accounts[1].providerID)
     }
 
-    @MainActor
-    func testSkipsAccountsThatAlreadyHaveAClaudeCard() {
-        let both = #"{"type":"claude","email":"amy@x.nl","account_uuid":"U-AMY","organization_uuid":"O-1","access_token":"a"}"#
-        let proxyOnly = #"{"type":"claude","email":"zed@x.nl","account_uuid":"u-zed","organization_uuid":"o-2","access_token":"a"}"#
-        let s = store([
-            "\(Self.authDir)/claude-1-amy@x.nl.json": both,
-            "\(Self.authDir)/claude-2-zed@x.nl.json": proxyOnly
-        ], config: "auth-dir: \(Self.authDir)\n")
-
-        let providers = CLIProxyAPIClaudeProvider.discover(authStore: s, skipping: ["u-amy|o-1"])
-
-        XCTAssertEqual(providers.map(\.account.email), ["zed@x.nl"])
-    }
-
     func testAccessTokenRejectsExpiredAndDisabledAccountsWithoutRefreshing() {
         let path = "\(Self.authDir)/claude-1-a@x.nl.json"
         let ref = CLIProxyAPIClaudeAccountRef(path: path, email: "a@x.nl", accountUUID: "u")

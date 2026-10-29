@@ -26,7 +26,7 @@ OpenUsage reads the `claude-*.json` files in CLIProxyAPI's auth folder. It finds
 
 If no config sets `auth-dir`, it uses `~/.cli-proxy-api`.
 
-If an account is also signed in to Claude Code or Claude Desktop, it already has a normal Claude card, so OpenUsage does not add a second card for it.
+An account that is also signed in to Claude Code or Claude Desktop shows on both its CLIProxyAPI card and the main Claude card. Turn one off in Settings if you only want one.
 
 Accounts are found when OpenUsage starts. **Restart OpenUsage after you add or remove an account in CLIProxyAPI.**
 

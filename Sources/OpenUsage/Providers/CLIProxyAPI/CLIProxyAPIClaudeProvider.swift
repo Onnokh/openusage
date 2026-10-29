@@ -44,16 +44,10 @@ final class CLIProxyAPIClaudeProvider: ProviderRuntime {
     }
 
     /// One provider per account currently in the CLIProxyAPI auth dir. Read once at launch, because the
-    /// widget registry is fixed for the life of the process. `skipping` holds the `account|organization`
-    /// identity keys that already have a Claude card, so an account signed in to both Claude Code and
-    /// CLIProxyAPI shows once.
-    static func discover(
-        authStore: CLIProxyAPIAuthStore = CLIProxyAPIAuthStore(),
-        skipping claudeIdentityKeys: Set<String> = []
-    ) -> [CLIProxyAPIClaudeProvider] {
-        authStore.discoverClaudeAccounts()
-            .filter { !claudeIdentityKeys.contains($0.identityKey) }
-            .map { CLIProxyAPIClaudeProvider(account: $0, authStore: authStore) }
+    /// widget registry is fixed for the life of the process. An account also signed in to Claude Code
+    /// keeps its card too: the main Claude card can be turned off, and then it would show nowhere.
+    static func discover(authStore: CLIProxyAPIAuthStore = CLIProxyAPIAuthStore()) -> [CLIProxyAPIClaudeProvider] {
+        authStore.discoverClaudeAccounts().map { CLIProxyAPIClaudeProvider(account: $0, authStore: authStore) }
     }
 
     var widgetDescriptors: [WidgetDescriptor] {

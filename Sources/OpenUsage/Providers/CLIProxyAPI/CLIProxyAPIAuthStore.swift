@@ -8,7 +8,6 @@ struct CLIProxyAPIClaudeAccount: Decodable, Hashable, Sendable {
     var type: String?
     var email: String?
     var accountUUID: String?
-    var organizationUUID: String?
     var accessToken: String?
     /// RFC 3339 expiry of `accessToken` ("2026-10-16T22:59:03+02:00").
     var expired: String?
@@ -17,7 +16,6 @@ struct CLIProxyAPIClaudeAccount: Decodable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case type, email, expired, disabled
         case accountUUID = "account_uuid"
-        case organizationUUID = "organization_uuid"
         case accessToken = "access_token"
     }
 }
@@ -27,12 +25,6 @@ struct CLIProxyAPIClaudeAccountRef: Hashable, Sendable {
     var path: String
     var email: String
     var accountUUID: String
-    var organizationUUID: String?
-
-    /// Same `account|organization` key the Claude cards use, lowercased like theirs.
-    var identityKey: String {
-        "\(accountUUID)|\(organizationUUID ?? "")".lowercased()
-    }
 
     /// Stable provider id, derived from a hash of the account UUID so the raw account id never reaches
     /// layout storage or telemetry.
@@ -116,9 +108,7 @@ struct CLIProxyAPIAuthStore: Sendable {
                       account.type == "claude",
                       let uuid = account.accountUUID, !uuid.isEmpty
                 else { return nil }
-                return CLIProxyAPIClaudeAccountRef(
-                    path: path, email: account.email ?? uuid, accountUUID: uuid, organizationUUID: account.organizationUUID
-                )
+                return CLIProxyAPIClaudeAccountRef(path: path, email: account.email ?? uuid, accountUUID: uuid)
             }
             .sorted { $0.email < $1.email }
         AppLog.info(LogTag.auth("cliproxyapi"), "found \(refs.count) Claude account\(refs.count == 1 ? "" : "s")")

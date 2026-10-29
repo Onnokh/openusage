@@ -68,9 +68,7 @@ final class AppContainer {
         // the snapshot cache's account stamp and reconciles the account registry.
         let accountAssembly = await ProviderAccountAssembly.make(waitsForLoginShell: true)
 
-        let cliProxyClaude = CLIProxyAPIClaudeProvider.discover(
-            skipping: Set(accountAssembly.claudeCards.map(\.identityKey) + accountAssembly.identityKeysByCard.values)
-        )
+        let cliProxyClaude = CLIProxyAPIClaudeProvider.discover()
         let providers = ProviderCatalog.make(
             claudeCards: accountAssembly.claudeCards,
             codex: accountAssembly.codex,
