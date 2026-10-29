@@ -59,6 +59,16 @@ extension ClaudeAuthError: CategorizedError {
     }
 }
 
+extension CLIProxyAPIError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .accountMissing: .notLoggedIn
+        case .accountDisabled: .notAvailable
+        case .tokenExpired, .tokenRejected: .authExpired
+        }
+    }
+}
+
 extension ClaudeUsageError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
