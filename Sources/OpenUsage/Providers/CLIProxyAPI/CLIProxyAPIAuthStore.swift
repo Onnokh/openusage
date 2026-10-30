@@ -138,6 +138,29 @@ struct CLIProxyAPIAuthStore: Sendable {
         return token
     }
 
+    /// The account's routing priority in CLIProxyAPI. CLIProxyAPI sends requests to the highest priority
+    /// that is not cooling down, and reads a missing value as 0. It also accepts the number as a string.
+    func priority(for ref: CLIProxyAPIClaudeAccountRef) throws -> Int {
+        let object = try jsonObject(path: ref.path)
+        return ProviderParse.number(object["priority"]).map { Int($0) } ?? 0
+    }
+
+    /// Rewrites only `priority` in the account file and keeps every other field. CLIProxyAPI watches its
+    /// auth dir and reloads the file on the rename that `writeText` ends with.
+    func setPriority(_ priority: Int, for ref: CLIProxyAPIClaudeAccountRef) throws {
+        var object = try jsonObject(path: ref.path)
+        object["priority"] = priority
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        try files.writeText(ref.path, String(decoding: data, as: UTF8.self))
+    }
+
+    private func jsonObject(path: String) throws -> [String: Any] {
+        guard let object = ProviderParse.jsonObject(Data(try files.readText(path).utf8)) else {
+            throw CLIProxyAPIError.accountMissing
+        }
+        return object
+    }
+
     /// Reads `auth-dir:` from the YAML config. Both layouts set it as a plain `auth-dir: "<path>"` line
     /// (top-level in older configs, under `oauth:` in newer ones), so a line match covers both without a
     /// YAML dependency.

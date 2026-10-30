@@ -33,6 +33,7 @@ struct WidgetGroupedListView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .task { await container.cliProxyPrimary.reload() }
         .onPreferenceChange(ReorderFramePreferenceKey.self) { frameStore.frames = $0 }
         .animation(Motion.spring, value: layout.displayGroups.map(\.provider.id))
     }
@@ -53,7 +54,8 @@ struct WidgetGroupedListView: View {
             warning: dataStore.headerNotice(for: group.provider.id),
             refreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
             staleness: dataStore.stalenessHint(for: group.provider.id),
-            onCopyScreenshot: { shareCard(group) }
+            onCopyScreenshot: { shareCard(group) },
+            primary: primaryBinding(for: group.provider.id)
         )
         // Keep the provider mark and hover-revealed copy control aligned with the card's content edges.
         .padding(.horizontal, 8)
@@ -74,6 +76,15 @@ struct WidgetGroupedListView: View {
             Divider()
             Button("Share Screenshot") { _ = shareCard(group) }
         }
+    }
+
+    private func primaryBinding(for providerID: String) -> Binding<Bool>? {
+        let store = container.cliProxyPrimary
+        guard store.hasSwitch(providerID) else { return nil }
+        return Binding(
+            get: { store.primaryID == providerID },
+            set: { isOn in Task { await store.setPrimary(providerID, isOn) } }
+        )
     }
 
     /// Renders the provider's branded share card and copies the PNG to the clipboard. The appearance is
